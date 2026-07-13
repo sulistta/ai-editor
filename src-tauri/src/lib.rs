@@ -11,7 +11,7 @@ use domain::{
     project_apply, project_autosave, project_new, project_open, project_redo, project_save, project_snapshot,
     project_undo, AppState,
 };
-use media::{media_import, media_probe, media_proxy};
+use media::{media_import, media_import_url, media_probe, media_proxy};
 use render::{render_cancel, render_start};
 use runtime::runtime_status;
 use transcription::transcription_start;
@@ -32,6 +32,7 @@ pub fn run() {
             project_open,
             media_probe,
             media_import,
+            media_import_url,
             media_proxy,
             transcription_start,
             gemini_key_set,

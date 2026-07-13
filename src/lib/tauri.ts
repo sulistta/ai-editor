@@ -67,6 +67,7 @@ export const nativeApi = {
   open: (path: string) => invoke<EditorProject>("project_open", { path }),
   probe: (path: string) => invoke<MediaProbe>("media_probe", { path }),
   import: (path: string, name: string) => invoke<MediaAsset>("media_import", { path, name }),
+  importUrl: (url: string) => invoke<MediaAsset>("media_import_url", { url }),
   proxy: (path: string, fingerprint?: string) => invoke<string>("media_proxy", { path, fingerprint }),
   transcribe: (request: TranscriptionRequest) => invoke<Transcript>("transcription_start", { request }),
   planEdit: (prompt: string, project: EditorProject, history: ChatMessage[]) => invoke<GeminiPlan>("agent_plan", { prompt, project, history: history.map(({ role, text }) => ({ role, text })) }),

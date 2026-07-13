@@ -128,6 +128,9 @@ function MediaPanel() {
   const editor = useEditor();
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
+  const [url, setUrl] = useState("");
+  const [showUrlImport, setShowUrlImport] = useState(false);
+  const [downloadingUrl, setDownloadingUrl] = useState(false);
   const [modelPath, setModelPath] = useState(() => localStorage.getItem("whisperModelPath") ?? "");
   const filtered = editor.project.assets.filter((asset) => asset.name.toLowerCase().includes(query.toLowerCase()));
 
@@ -153,6 +156,34 @@ function MediaPanel() {
     if (!files) return;
     for (const file of Array.from(files)) await editor.importAsset(await probeBrowserFile(file));
     if (inputRef.current) inputRef.current.value = "";
+  };
+
+  const importYoutube = async () => {
+    const value = url.trim();
+    if (!value || downloadingUrl) return;
+    if (!isTauriRuntime()) {
+      editor.setError("A importação do YouTube requer o aplicativo desktop.");
+      return;
+    }
+    const jobId = createId("download");
+    setDownloadingUrl(true);
+    editor.setJob({ id: jobId, kind: "download", label: "Baixando vídeo do YouTube", state: "running", progress: 0.1 });
+    editor.setStatus("Baixando vídeo do YouTube");
+    try {
+      const asset = await nativeApi.importUrl(value);
+      await editor.importAsset(asset);
+      if (asset.width && asset.height) void createProxy(asset);
+      editor.setJob({ id: jobId, kind: "download", label: `YouTube · ${asset.name}`, state: "completed", progress: 1 });
+      editor.setStatus("Vídeo do YouTube importado");
+      setUrl("");
+      setShowUrlImport(false);
+    } catch (error) {
+      const detail = errorMessage(error);
+      editor.setJob({ id: jobId, kind: "download", label: "Importação do YouTube", state: "failed", progress: 0, detail });
+      editor.setError(detail);
+    } finally {
+      setDownloadingUrl(false);
+    }
   };
 
   const transcribe = async (asset: MediaAsset) => {
@@ -211,9 +242,15 @@ function MediaPanel() {
   return (
     <div className="panel-content media-panel">
       <div className="panel-action-row">
-        <button className="primary-button compact" onClick={() => void importFiles()}><Icon name="plus" /> Importar</button>
+        <button className="primary-button compact" onClick={() => void importFiles()}><Icon name="plus" /> Arquivo</button>
+        <button className={`text-button compact ${showUrlImport ? "active" : ""}`} onClick={() => setShowUrlImport((value) => !value)}><Icon name="open" /> YouTube</button>
         <input ref={inputRef} className="sr-only" type="file" accept="video/*,audio/*" multiple onChange={(event) => void onBrowserFiles(event.target.files)} />
       </div>
+      {showUrlImport && <form className="url-import" onSubmit={(event) => { event.preventDefault(); void importYoutube(); }}>
+        <label htmlFor="youtube-url">URL do YouTube</label>
+        <div><input id="youtube-url" type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://youtube.com/watch?v=…" autoFocus /><button className="primary-button compact" disabled={!url.trim() || downloadingUrl}>{downloadingUrl ? "Baixando" : "Importar"}</button></div>
+        <small>Use apenas vídeos que você tem permissão para baixar.</small>
+      </form>}
       <label className="search-field"><Icon name="search" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar mídia" /></label>
       <div className="asset-list" role="list">
         {filtered.length === 0 ? (
@@ -411,6 +448,7 @@ function useResolvedMediaSource(asset: MediaAsset | undefined, localPath: string
 function Viewer() {
   const editor = useEditor();
   const videoRef = useRef<HTMLVideoElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const playheadRef = useRef(editor.playheadTick);
   const playingRef = useRef(editor.isPlaying);
   const proxyAttemptsRef = useRef(new Set<string>());
@@ -420,6 +458,7 @@ function Viewer() {
   const [proxyingAssetId, setProxyingAssetId] = useState<string>();
   const [playbackError, setPlaybackError] = useState<string>();
   const [buffering, setBuffering] = useState(false);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const sequence = activeSequence(editor.project);
   const selected = selectedClipData(editor.project, editor.selection.clipIds);
   const items = playbackItems(sequence);
@@ -449,6 +488,17 @@ function Viewer() {
     playingRef.current = editor.isPlaying;
     actionsRef.current = { setError: editor.setError, setPlaying: editor.setPlaying, setPlayhead: editor.setPlayhead, setStatus: editor.setStatus };
   }, [editor.isPlaying, editor.playheadTick, editor.setError, editor.setPlaying, editor.setPlayhead, editor.setStatus]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) setStageSize({ width: entry.contentRect.width, height: entry.contentRect.height });
+    });
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, []);
 
   const stopPlayback = () => {
     videoRef.current?.pause();
@@ -591,12 +641,23 @@ function Viewer() {
   const transitionOutOpacity = previewClip?.transitionOut ? Math.min(1, remaining / Math.max(1, previewClip.transitionOut.durationTicks)) : 1;
   const transitionOpacity = Math.min(transitionInOpacity, transitionOutOpacity);
   const frameTick = Math.round(editor.project.settings.timebase * editor.project.settings.fpsDen / editor.project.settings.fpsNum);
+  const totalTicks = Math.max(frameTick, sequenceDuration(sequence));
+  const programAspect = editor.project.settings.width / editor.project.settings.height;
+  const frameWidth = stageSize.width > 0 ? Math.max(1, Math.min(stageSize.width - 28, (stageSize.height - 24) * programAspect)) : undefined;
+  const frameHeight = frameWidth ? frameWidth / programAspect : undefined;
+  const seek = (tick: number) => {
+    const bounded = Math.max(0, Math.min(totalTicks, tick));
+    editor.setPlayhead(bounded);
+    const item = activePlaybackItem(items, bounded);
+    if (videoRef.current && item) configureMediaElement(videoRef.current, item, bounded);
+  };
   return (
     <section className="viewer" aria-label="Monitor de programa">
-      <div className="viewer-head"><span>Program</span><span>{editor.project.settings.width}×{editor.project.settings.height} · {editor.project.settings.fpsNum / editor.project.settings.fpsDen} fps</span></div>
-      <div className="viewer-stage">
-        {source ? (
-          <video
+      <div className="viewer-head"><span>Programa</span><span className="viewer-source">{previewClip?.name ?? asset?.name ?? "Sem mídia"}</span><span>{editor.project.settings.width}×{editor.project.settings.height} · {editor.project.settings.fpsNum / editor.project.settings.fpsDen} fps</span></div>
+      <div className="viewer-stage" ref={stageRef}>
+        <div className="program-frame" style={{ width: frameWidth, height: frameHeight }}>
+          {source ? (
+            <video
             ref={videoRef}
             src={source}
             className={asset?.width && asset.height ? undefined : "audio-engine"}
@@ -635,19 +696,19 @@ function Viewer() {
               filter: clipCssFilter(previewClip),
               clipPath: `inset(${transform.cropTop * 100}% ${transform.cropRight * 100}% ${transform.cropBottom * 100}% ${transform.cropLeft * 100}%)`,
             } : undefined}
-          />
-        ) : <div className="viewer-empty"><Icon name="video" /><strong>{assetProxyJob ? "Gerando proxy compatível" : sourceLoading ? "Carregando mídia local" : "Nenhuma mídia no monitor"}</strong><span>{assetProxyJob ? "O vídeo será carregado automaticamente quando o proxy estiver pronto." : sourceLoading ? "Preparando uma fonte compatível com o monitor." : "Selecione um asset ou posicione o playhead sobre um clipe."}</span></div>}
-        {source && asset && !asset.width && <div className="viewer-audio"><Icon name="audio" /><strong>{asset.name}</strong><span>Pré-visualização de áudio</span></div>}
-        {(buffering || assetProxyJob || sourceLoading) && <div className="viewer-buffering" role="status"><span /> {proxyingAssetId || assetProxyJob ? "Gerando proxy compatível" : "Preparando mídia"}</div>}
-        {(playbackError || sourceLoadError) && <div className="viewer-error" role="alert"><strong>Falha na reprodução</strong><span>{playbackError ?? `Não foi possível carregar a mídia local: ${sourceLoadError}`}</span><button className="text-button" onClick={togglePlayback}>Tentar novamente</button></div>}
-        {caption && <div className="caption-preview">{caption.text}</div>}
-        <div className="safe-area" aria-hidden="true" />
+            />
+          ) : <div className="viewer-empty"><Icon name="video" /><strong>{assetProxyJob ? "Gerando proxy compatível" : sourceLoading ? "Carregando mídia local" : "Nenhuma mídia no monitor"}</strong><span>{assetProxyJob ? "O vídeo será carregado automaticamente quando o proxy estiver pronto." : sourceLoading ? "Preparando uma fonte compatível com o monitor." : "Selecione um asset ou posicione o playhead sobre um clipe."}</span></div>}
+          {source && asset && !asset.width && <div className="viewer-audio"><Icon name="audio" /><strong>{asset.name}</strong><span>Pré-visualização de áudio</span></div>}
+          {(buffering || assetProxyJob || sourceLoading) && <div className="viewer-buffering" role="status"><span /> {proxyingAssetId || assetProxyJob ? "Gerando proxy compatível" : "Preparando mídia"}</div>}
+          {(playbackError || sourceLoadError) && <div className="viewer-error" role="alert"><strong>Falha na reprodução</strong><span>{playbackError ?? `Não foi possível carregar a mídia local: ${sourceLoadError}`}</span><button className="text-button" onClick={togglePlayback}>Tentar novamente</button></div>}
+          {caption && <div className="caption-preview">{caption.text}</div>}
+          <div className="safe-area" aria-hidden="true" />
+        </div>
       </div>
       <div className="transport">
-        <button className="icon-button" onClick={() => editor.setPlayhead(Math.max(0, editor.playheadTick - frameTick))} aria-label="Frame anterior">−1</button>
-        <button className="transport-play" onClick={togglePlayback} disabled={!playbackCandidate || !playbackSource} aria-label={editor.isPlaying ? "Pausar" : "Reproduzir vídeo"} title={editor.isPlaying ? "Pausar (Espaço)" : "Reproduzir vídeo (Espaço)"}><Icon name={editor.isPlaying ? "pause" : "play"} /></button>
-        <button className="icon-button" onClick={() => editor.setPlayhead(editor.playheadTick + frameTick)} aria-label="Próximo frame">+1</button>
-        <span className="timecode">{formatTimecode(editor.playheadTick, editor.project.settings.fpsNum, editor.project.settings.fpsDen)}</span>
+        <div className="transport-controls"><button className="icon-button" onClick={() => seek(editor.playheadTick - frameTick)} aria-label="Frame anterior" title="Frame anterior">−1</button><button className="transport-play" onClick={togglePlayback} disabled={!playbackCandidate || !playbackSource} aria-label={editor.isPlaying ? "Pausar" : "Reproduzir vídeo"} title={editor.isPlaying ? "Pausar (Espaço)" : "Reproduzir vídeo (Espaço)"}><Icon name={editor.isPlaying ? "pause" : "play"} /></button><button className="icon-button" onClick={() => seek(editor.playheadTick + frameTick)} aria-label="Próximo frame" title="Próximo frame">+1</button></div>
+        <label className="program-scrubber"><span className="sr-only">Posição da reprodução</span><input type="range" min={0} max={totalTicks} step={frameTick} value={Math.min(editor.playheadTick, totalTicks)} onPointerDown={stopPlayback} onChange={(event) => seek(Number(event.target.value))} /></label>
+        <div className="transport-time"><span className="timecode">{formatTimecode(editor.playheadTick, editor.project.settings.fpsNum, editor.project.settings.fpsDen)}</span><span>/ {formatTimecode(totalTicks, editor.project.settings.fpsNum, editor.project.settings.fpsDen)}</span></div>
       </div>
     </section>
   );
@@ -784,7 +845,7 @@ function StatusBar() {
     void nativeApi.runtimeStatus(localStorage.getItem("whisperModelPath") ?? undefined).then(setRuntime).catch(() => undefined);
   }, []);
   const activeJobs = editor.jobs.filter((job) => job.state === "running");
-  return <footer className="statusbar"><div>{activeJobs.length ? activeJobs.map((job) => <span key={job.id} className="job-status"><i style={{ width: `${job.progress * 100}%` }} />{job.label}</span>) : editor.status}</div><div><span className={isTauriRuntime() ? "runtime-ok" : "runtime-missing"}>{isTauriRuntime() ? "Desktop" : "Preview web"}</span>{runtime && <><span className={runtime.ffmpeg.available && runtime.ffprobe.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.ffmpeg.detail} · ${runtime.ffprobe.detail}`}>FFmpeg</span><span className={runtime.whisper.available && runtime.model.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.whisper.detail} · ${runtime.model.detail}`}>Whisper</span></>}<span>Rev {editor.project.revision}</span><span>{editor.project.assets.length} assets</span></div></footer>;
+  return <footer className="statusbar"><div>{activeJobs.length ? activeJobs.map((job) => <span key={job.id} className="job-status"><i style={{ width: `${job.progress * 100}%` }} />{job.label}</span>) : editor.status}</div><div><span className={isTauriRuntime() ? "runtime-ok" : "runtime-missing"}>{isTauriRuntime() ? "Desktop" : "Preview web"}</span>{runtime && <><span className={runtime.ffmpeg.available && runtime.ffprobe.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.ffmpeg.detail} · ${runtime.ffprobe.detail}`}>FFmpeg</span><span className={runtime.youtube.available ? "runtime-ok" : "runtime-missing"} title={runtime.youtube.detail}>YouTube</span><span className={runtime.whisper.available && runtime.model.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.whisper.detail} · ${runtime.model.detail}`}>Whisper</span></>}<span>Rev {editor.project.revision}</span><span>{editor.project.assets.length} assets</span></div></footer>;
 }
 
 export function Workspace() {

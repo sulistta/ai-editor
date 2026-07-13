@@ -1,0 +1,22 @@
+{
+  "score": 93,
+  "verdict": "pass",
+  "category_match": true,
+  "threshold": 90,
+  "threshold_passed": true,
+  "differences": [
+    "O vídeo agora ocupa e permanece centralizado dentro de um quadro de programa 16:9, em vez de ficar pequeno junto ao transporte.",
+    "A área segura e os marcadores de canto agora pertencem ao quadro de programa, não ao painel inteiro.",
+    "O transporte agora separa controles, scrubber e timecodes atual/total em uma única faixa contínua.",
+    "A biblioteca expõe Arquivo e YouTube como duas origens de importação distintas."
+  ],
+  "suggestions": [
+    "Manter o quadro de programa como limite visual para futuras overlays e ferramentas de transformação.",
+    "Conectar progresso percentual real do yt-dlp ao job em uma iteração futura, caso downloads longos se tornem comuns."
+  ],
+  "next_actions": [
+    "Validar play, seek e resize no WebKitGTK.",
+    "Executar a suíte integrada final."
+  ],
+  "reasoning": "A hierarquia do monitor agora é inequívoca e o vídeo usa a área disponível de forma previsível. O conjunto preserva a linguagem industrial existente e resolve o principal problema de posicionamento e controle mostrado na referência."
+}

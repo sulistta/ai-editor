@@ -163,7 +163,7 @@ export interface ChatMessage {
 
 export interface EditorJob {
   id: string;
-  kind: "proxy" | "transcription" | "render" | "agent";
+  kind: "proxy" | "download" | "transcription" | "render" | "agent";
   label: string;
   state: JobState;
   progress: number;
@@ -232,4 +232,5 @@ export interface RuntimeStatus {
   ffprobe: DependencyStatus;
   whisper: DependencyStatus;
   model: DependencyStatus;
+  youtube: DependencyStatus;
 }

@@ -84,12 +84,18 @@ async fn dependency(binary: PathBuf, version_arg: &str) -> DependencyStatus {
 
 #[tauri::command]
 pub async fn runtime_status(model_path: Option<String>, app: tauri::AppHandle) -> RuntimeStatus {
-    let (ffmpeg, ffprobe, whisper, youtube) = tokio::join!(
+    let (ffmpeg, ffprobe, whisper, ytdlp, node) = tokio::join!(
         dependency(ffmpeg_binary(), "-version"),
         dependency(ffprobe_binary(), "-version"),
         dependency(whisper_binary(), "--help"),
         dependency(ytdlp_binary(&app), "--version"),
+        dependency(PathBuf::from("node"), "--version"),
     );
+    let youtube = if ytdlp.available && node.available {
+        DependencyStatus { available: true, detail: format!("yt-dlp · {}", node.detail) }
+    } else {
+        DependencyStatus { available: false, detail: format!("yt-dlp: {} · Node 22+: {}", ytdlp.detail, node.detail) }
+    };
     let model = match resolve_whisper_model(model_path.as_deref()) {
         Ok(path) => DependencyStatus { available: true, detail: path.to_string_lossy().into_owned() },
         Err(error) => DependencyStatus { available: false, detail: error.message },

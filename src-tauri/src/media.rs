@@ -1,4 +1,4 @@
-use crate::{domain::{MediaAsset, TICKS_PER_SECOND}, error::AppError, runtime::{ffmpeg_binary, ffprobe_binary}};
+use crate::{domain::{MediaAsset, TICKS_PER_SECOND}, error::AppError, runtime::{ffmpeg_binary, ffprobe_binary, ytdlp_binary}};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -90,17 +90,19 @@ async fn extract_waveform(path: &Path) -> Option<Vec<f32>> {
     Some(samples.chunks(bucket_size).map(|bucket| bucket.iter().copied().fold(0.0f32, f32::max).clamp(0.0, 1.0)).collect())
 }
 
-#[tauri::command]
-pub async fn media_probe(path: String) -> Result<MediaProbe, AppError> {
-    probe_path(&path).await
+fn validate_youtube_url(value: &str) -> Result<String, AppError> {
+    let url = reqwest::Url::parse(value.trim()).map_err(|_| AppError::new("INVALID_URL", "Informe uma URL válida do YouTube"))?;
+    if url.scheme() != "https" { return Err(AppError::new("INVALID_URL", "A URL do YouTube deve usar HTTPS")); }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed = host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com");
+    if !allowed { return Err(AppError::new("UNSUPPORTED_URL", "Somente URLs do YouTube são aceitas")); }
+    Ok(url.into())
 }
 
-#[tauri::command]
-pub async fn media_import(path: String, name: String, app: tauri::AppHandle) -> Result<MediaAsset, AppError> {
-    let canonical = tokio::fs::canonicalize(&path).await.map_err(|_| AppError::new("MEDIA_NOT_FOUND", "O arquivo de mídia não foi encontrado"))?;
+async fn imported_asset(canonical: &Path, name: String, app: &tauri::AppHandle) -> Result<MediaAsset, AppError> {
     let probe = probe_path(canonical.to_string_lossy().as_ref()).await?;
-    let waveform = if probe.has_audio { extract_waveform(&canonical).await } else { None };
-    allow_asset_file(&app, &canonical)?;
+    let waveform = if probe.has_audio { extract_waveform(canonical).await } else { None };
+    allow_asset_file(app, canonical)?;
     Ok(MediaAsset {
         id: format!("asset-{}", Uuid::new_v4()),
         name,
@@ -117,6 +119,42 @@ pub async fn media_import(path: String, name: String, app: tauri::AppHandle) -> 
         waveform,
         offline: false,
     })
+}
+
+#[tauri::command]
+pub async fn media_probe(path: String) -> Result<MediaProbe, AppError> {
+    probe_path(&path).await
+}
+
+#[tauri::command]
+pub async fn media_import(path: String, name: String, app: tauri::AppHandle) -> Result<MediaAsset, AppError> {
+    let canonical = tokio::fs::canonicalize(&path).await.map_err(|_| AppError::new("MEDIA_NOT_FOUND", "O arquivo de mídia não foi encontrado"))?;
+    imported_asset(&canonical, name, &app).await
+}
+
+#[tauri::command]
+pub async fn media_import_url(url: String, app: tauri::AppHandle) -> Result<MediaAsset, AppError> {
+    let url = validate_youtube_url(&url)?;
+    let directory = app.path().app_cache_dir().map_err(|error| AppError::new("CACHE_PATH", error.to_string()))?.join("youtube");
+    tokio::fs::create_dir_all(&directory).await?;
+    let output = Command::new(ytdlp_binary(&app))
+        .args(["--ignore-config", "--no-playlist", "--no-progress", "--no-overwrites", "--windows-filenames", "--js-runtimes", "node", "--print", "after_move:filepath", "--merge-output-format", "mp4", "-f", "bv*[height<=1080]+ba/b[height<=1080]"])
+        .arg("-P").arg(&directory)
+        .args(["-o", "%(title).120B [%(id)s].%(ext)s", "--"])
+        .arg(&url)
+        .output().await
+        .map_err(|error| AppError::new("YTDLP_NOT_FOUND", format!("Não foi possível iniciar o importador do YouTube: {error}")))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).lines().rfind(|line| !line.trim().is_empty()).unwrap_or("Falha ao baixar o vídeo").to_string();
+        return Err(AppError::retryable("YOUTUBE_DOWNLOAD_FAILED", detail));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reported = stdout.lines().rfind(|line| !line.trim().is_empty()).map(str::trim).ok_or_else(|| AppError::new("YOUTUBE_OUTPUT_MISSING", "O download terminou sem informar o arquivo gerado"))?;
+    let canonical = tokio::fs::canonicalize(reported).await.map_err(|_| AppError::new("YOUTUBE_OUTPUT_MISSING", "O arquivo baixado não foi encontrado"))?;
+    let canonical_directory = tokio::fs::canonicalize(&directory).await?;
+    if !canonical.starts_with(&canonical_directory) { return Err(AppError::new("YOUTUBE_OUTPUT_INVALID", "O importador retornou um caminho fora do cache permitido")); }
+    let name = canonical.file_name().and_then(|value| value.to_str()).unwrap_or("Vídeo do YouTube").to_string();
+    imported_asset(&canonical, name, &app).await
 }
 
 #[tauri::command]
@@ -176,5 +214,13 @@ mod tests {
     fn parses_ntsc_fraction() {
         assert!((parse_fraction("30000/1001").unwrap() - 29.97002997).abs() < 0.0001);
         assert!(parse_fraction("1/0").is_none());
+    }
+
+    #[test]
+    fn accepts_only_https_youtube_urls() {
+        assert!(validate_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").is_ok());
+        assert!(validate_youtube_url("https://youtu.be/dQw4w9WgXcQ").is_ok());
+        assert!(validate_youtube_url("http://youtube.com/watch?v=x").is_err());
+        assert!(validate_youtube_url("https://youtube.com.example.test/watch?v=x").is_err());
     }
 }
