@@ -1,11 +1,14 @@
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEditor } from "../context/EditorContext";
-import { activePlaybackItem, isCurrentCompatibilityProxy, mediaVolume, needsCompatibilityProxy, playbackFailureMessage, playbackItemAtOrAfter, playbackItems, resolvePlaybackAsset, timelineTickToMediaSeconds, type PlaybackItem } from "../lib/playback";
-import { activeSequence, captionsFromTranscript, createId, sequenceDuration } from "../lib/project";
+import { formatAgentQuestion, resolveRetryPrompt } from "../lib/agent";
+import { scheduleAppSurfaceRefresh } from "../lib/compositor";
+import { activeAudioPlaybackItems, activePlaybackItem, activeVideoPlaybackItem, mediaSecondsToTimelineTick, mediaVolume, needsCompatibilityProxy, playbackFailureMessage, playbackItems, playbackRecoveryAction, programPreviewTick, resolvePlaybackAsset, timelineTickToMediaSeconds, type PlaybackItem } from "../lib/playback";
+import { activeSequence, captionsFromTranscript, createId, DEFAULT_CAPTION_STYLE, sequenceDuration } from "../lib/project";
 import { chooseExportPath, chooseMediaPaths, chooseProjectOpenPath, chooseProjectPath, chooseWhisperModelPath, errorMessage, isTauriRuntime, nativeApi } from "../lib/tauri";
 import { formatTimecode, secondsToTicks, ticksToSeconds } from "../lib/time";
+import { autoTranscriptionDecision } from "../lib/transcription";
 import type { CaptionCue, EffectInstance, MediaAsset, RuntimeStatus, TimelineClip, WhisperModelStatus } from "../types";
 import { Icon, type IconName } from "./Icons";
 import { Timeline } from "./Timeline";
@@ -52,6 +55,100 @@ async function probeBrowserFile(file: File): Promise<MediaAsset> {
     fingerprint: `${file.size}-${file.lastModified}`,
     offline: false,
   };
+}
+
+type AutomaticTranscriptionDecision = ReturnType<typeof autoTranscriptionDecision>;
+
+function useAutomaticTranscription(editor: ReturnType<typeof useEditor>, modelPath: string) {
+  const editorRef = useRef(editor);
+  const modelPathRef = useRef(modelPath);
+  const queuedAssetsRef = useRef(new Set<string>());
+  const pendingAssetsRef = useRef(new Map<string, MediaAsset>());
+  const taskQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    editorRef.current = editor;
+  }, [editor]);
+
+  useEffect(() => {
+    modelPathRef.current = modelPath;
+  }, [modelPath]);
+
+  const enqueue = useCallback((asset: MediaAsset, requestedModelPath: string) => {
+    if (!asset.path || queuedAssetsRef.current.has(asset.id)) return;
+    queuedAssetsRef.current.add(asset.id);
+    pendingAssetsRef.current.delete(asset.id);
+    const jobId = `transcription-${asset.id}`;
+    const label = `Transcrição automática · ${asset.name}`;
+    editorRef.current.setJob({ id: jobId, kind: "transcription", label, state: "queued", progress: 0, detail: "Aguardando execução" });
+
+    const run = async () => {
+      try {
+        const current = editorRef.current;
+        if (current.project.transcripts.some((transcript) => transcript.assetId === asset.id)) {
+          current.setJob({ id: jobId, kind: "transcription", label, state: "completed", progress: 1 });
+          return;
+        }
+        current.setJob({ id: jobId, kind: "transcription", label, state: "running", progress: 0 });
+        current.setStatus(`Transcrevendo ${asset.name} automaticamente`);
+        const transcript = await nativeApi.transcribe({ assetId: asset.id, mediaPath: asset.path!, modelPath: modelPathRef.current || requestedModelPath });
+        if (!editorRef.current.project.assets.some((candidate) => candidate.id === asset.id)) {
+          editorRef.current.setJob({ id: jobId, kind: "transcription", label, state: "cancelled", progress: 0, detail: "O projeto ativo mudou durante a transcrição" });
+          return;
+        }
+        await editorRef.current.setTranscript(transcript);
+        editorRef.current.setJob({ id: jobId, kind: "transcription", label, state: "completed", progress: 1 });
+        editorRef.current.setStatus(`Transcrição automática de ${asset.name} concluída`);
+      } catch (error) {
+        const detail = errorMessage(error);
+        pendingAssetsRef.current.set(asset.id, asset);
+        editorRef.current.setJob({ id: jobId, kind: "transcription", label, state: "failed", progress: 0, detail });
+        editorRef.current.setError(`Transcrição automática de “${asset.name}” falhou: ${detail}`);
+      } finally {
+        queuedAssetsRef.current.delete(asset.id);
+      }
+    };
+
+    taskQueueRef.current = taskQueueRef.current.then(run, run);
+  }, []);
+
+  const resumePending = useCallback((nextModelPath: string) => {
+    if (!nextModelPath) return;
+    modelPathRef.current = nextModelPath;
+    for (const asset of pendingAssetsRef.current.values()) {
+      if (editorRef.current.project.assets.some((candidate) => candidate.id === asset.id)) enqueue(asset, nextModelPath);
+      else pendingAssetsRef.current.delete(asset.id);
+    }
+  }, [enqueue]);
+
+  useEffect(() => {
+    resumePending(modelPath);
+  }, [modelPath, resumePending]);
+
+  const schedule = useCallback((asset: MediaAsset): AutomaticTranscriptionDecision => {
+    const current = editorRef.current;
+    const decision = autoTranscriptionDecision(asset, {
+      desktop: isTauriRuntime(),
+      hasModel: Boolean(modelPathRef.current),
+      hasTranscript: current.project.transcripts.some((transcript) => transcript.assetId === asset.id),
+    });
+    if (decision === "ready") enqueue(asset, modelPathRef.current);
+    if (decision === "waiting-model") {
+      pendingAssetsRef.current.set(asset.id, asset);
+      current.setJob({
+        id: `transcription-${asset.id}`,
+        kind: "transcription",
+        label: `Transcrição automática · ${asset.name}`,
+        state: "queued",
+        progress: 0,
+        detail: "Aguardando modelo Whisper ativo",
+      });
+      current.setStatus(`${asset.name} importado; transcrição aguardando um modelo Whisper`);
+    }
+    return decision;
+  }, [enqueue]);
+
+  return { schedule, resumePending };
 }
 
 function TopBar() {
@@ -129,21 +226,31 @@ function TopBar() {
   );
 }
 
-function MediaPanel() {
+function MediaPanel({
+  modelPath,
+  onModelPathChange,
+  scheduleAutomaticTranscription,
+}: {
+  modelPath: string;
+  onModelPathChange: (path: string) => void;
+  scheduleAutomaticTranscription: (asset: MediaAsset) => AutomaticTranscriptionDecision;
+}) {
   const editor = useEditor();
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [url, setUrl] = useState("");
   const [showUrlImport, setShowUrlImport] = useState(false);
   const [downloadingUrl, setDownloadingUrl] = useState(false);
-  const [modelPath, setModelPath] = useState(() => localStorage.getItem("whisperModelPath") ?? "");
-  const [showModels, setShowModels] = useState(false);
+  const [showModels, setShowModels] = useState(() => editor.jobs.some((job) => job.kind === "transcription" && job.state === "queued" && job.detail?.includes("modelo Whisper")));
   const [models, setModels] = useState<WhisperModelStatus[]>([]);
   const [modelBusy, setModelBusy] = useState<string>();
   const modelManagerRef = useRef<HTMLElement>(null);
-  const setEditorJob = editor.setJob;
-  const setEditorError = editor.setError;
+  const setEditorErrorRef = useRef(editor.setError);
   const filtered = editor.project.assets.filter((asset) => asset.name.toLowerCase().includes(query.toLowerCase()));
+
+  useEffect(() => {
+    setEditorErrorRef.current = editor.setError;
+  }, [editor.setError]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -155,25 +262,28 @@ function MediaPanel() {
         setModels(next);
         const active = next.find((item) => item.active);
         if (active) {
-          setModelPath(active.path);
-          localStorage.setItem("whisperModelPath", active.path);
+          onModelPathChange(active.path);
         } else if (!next.some((item) => item.downloaded)) {
           setShowModels(true);
         }
       } catch (error) {
-        if (!disposed) setEditorError(errorMessage(error));
+        if (!disposed) setEditorErrorRef.current(errorMessage(error));
       }
     };
     void load();
     return () => {
       disposed = true;
     };
-  }, [setEditorError, setEditorJob]);
+  }, [onModelPathChange]);
 
   useEffect(() => {
     if (!showModels || !modelManagerRef.current) return;
     modelManagerRef.current.scrollIntoView({ block: "end" });
   }, [models.length, showModels]);
+
+  const scheduleImportedAsset = (asset: MediaAsset) => {
+    if (scheduleAutomaticTranscription(asset) === "waiting-model") setShowModels(true);
+  };
 
   const importFiles = async () => {
     if (!isTauriRuntime()) {
@@ -186,6 +296,7 @@ function MediaPanel() {
         const name = path.split(/[\\/]/).at(-1) ?? "Mídia";
         const asset = await nativeApi.import(path, name);
         await editor.importAsset(asset);
+        scheduleImportedAsset(asset);
         if (needsCompatibilityProxy(asset)) void createProxy(asset);
       } catch (error) {
         editor.setError(errorMessage(error));
@@ -195,7 +306,11 @@ function MediaPanel() {
 
   const onBrowserFiles = async (files: FileList | null) => {
     if (!files) return;
-    for (const file of Array.from(files)) await editor.importAsset(await probeBrowserFile(file));
+    for (const file of Array.from(files)) {
+      const asset = await probeBrowserFile(file);
+      await editor.importAsset(asset);
+      scheduleImportedAsset(asset);
+    }
     if (inputRef.current) inputRef.current.value = "";
   };
 
@@ -213,6 +328,7 @@ function MediaPanel() {
     try {
       const asset = await nativeApi.importUrl(value);
       await editor.importAsset(asset);
+      scheduleImportedAsset(asset);
       if (needsCompatibilityProxy(asset)) void createProxy(asset);
       editor.setJob({ id: jobId, kind: "download", label: `YouTube · ${asset.name}`, state: "completed", progress: 1 });
       editor.setStatus("Vídeo do YouTube importado");
@@ -227,35 +343,14 @@ function MediaPanel() {
     }
   };
 
-  const transcribe = async (asset: MediaAsset) => {
-    if (!asset.path || !isTauriRuntime()) {
-      editor.setStatus("A transcrição local requer o aplicativo desktop e um arquivo com caminho local");
-      return;
-    }
-    if (!modelPath && !models.some((item) => item.active && item.verified)) {
-      setShowModels(true);
-      editor.setStatus("Baixe e ative um modelo Whisper antes de transcrever");
-      return;
-    }
-    const jobId = `transcription-${asset.id}`;
-    editor.setJob({ id: jobId, kind: "transcription", label: `Transcrever ${asset.name}`, state: "running", progress: 0 });
-    try {
-      const transcript = await nativeApi.transcribe({ assetId: asset.id, mediaPath: asset.path, modelPath: modelPath || undefined });
-      await editor.setTranscript(transcript);
-      editor.setJob({ id: jobId, kind: "transcription", label: `Transcrever ${asset.name}`, state: "completed", progress: 1 });
-      editor.setStatus("Transcrição local concluída");
-    } catch (error) {
-      editor.setJob({ id: jobId, kind: "transcription", label: `Transcrever ${asset.name}`, state: "failed", progress: 0, detail: errorMessage(error) });
-      editor.setError(errorMessage(error));
-    }
-  };
-
   const relink = async (asset: MediaAsset) => {
     const [path] = await chooseMediaPaths();
     if (!path) return;
     try {
       const replacement = await nativeApi.import(path, path.split(/[\\/]/).at(-1) ?? asset.name);
-      await editor.commit("Relink de mídia", [{ type: "updateAsset", asset: { ...replacement, id: asset.id } }]);
+      const relinkedAsset = { ...replacement, id: asset.id };
+      await editor.commit("Relink de mídia", [{ type: "updateAsset", asset: relinkedAsset }]);
+      scheduleImportedAsset(relinkedAsset);
       editor.setStatus("Mídia relinkada");
     } catch (error) {
       editor.setError(errorMessage(error));
@@ -280,8 +375,7 @@ function MediaPanel() {
   const chooseModel = async () => {
     const path = await chooseWhisperModelPath();
     if (!path) return;
-    localStorage.setItem("whisperModelPath", path);
-    setModelPath(path);
+    onModelPathChange(path);
     editor.setStatus("Modelo whisper.cpp configurado");
   };
 
@@ -290,8 +384,9 @@ function MediaPanel() {
     setModels(next);
     const active = next.find((item) => item.active);
     if (active) {
-      setModelPath(active.path);
-      localStorage.setItem("whisperModelPath", active.path);
+      onModelPathChange(active.path);
+    } else if (!modelPath) {
+      localStorage.removeItem("whisperModelPath");
     }
   };
 
@@ -303,8 +398,7 @@ function MediaPanel() {
     editor.setStatus(`Baixando modelo ${model.info.label}`);
     try {
       const active = await nativeApi.modelDownload(model.info.id);
-      setModelPath(active.path);
-      localStorage.setItem("whisperModelPath", active.path);
+      onModelPathChange(active.path);
       await refreshModels();
       editor.setJob({ id: jobId, kind: "model", label: `Modelo ${model.info.label}`, state: "completed", progress: 1 });
       editor.setStatus(`Modelo ${model.info.label} ativo`);
@@ -325,8 +419,7 @@ function MediaPanel() {
   const activateModel = async (model: WhisperModelStatus) => {
     try {
       const active = await nativeApi.modelActivate(model.info.id);
-      setModelPath(active.path);
-      localStorage.setItem("whisperModelPath", active.path);
+      onModelPathChange(active.path);
       await refreshModels();
       editor.setStatus(`Modelo ${model.info.label} ativo`);
     } catch (error) {
@@ -362,6 +455,20 @@ function MediaPanel() {
           <div className="empty-panel"><Icon name="media" /><strong>Nenhuma mídia</strong><span>Importe arquivos para montar a sequência.</span></div>
         ) : filtered.map((asset) => {
           const transcript = editor.project.transcripts.find((item) => item.assetId === asset.id);
+          const transcriptionJob = editor.jobs.find((job) => job.id === `transcription-${asset.id}`);
+          const transcriptionStatus = transcript
+            ? "Transcrição disponível"
+            : transcriptionJob?.state === "running"
+              ? "Transcrevendo automaticamente"
+              : transcriptionJob?.state === "queued"
+                ? transcriptionJob.detail ?? "Transcrição na fila"
+                : transcriptionJob?.state === "failed"
+                  ? `Falha na transcrição: ${transcriptionJob.detail ?? "erro desconhecido"}`
+                  : !asset.hasAudio
+                    ? "Mídia sem faixa de áudio"
+                    : !isTauriRuntime()
+                      ? "Transcrição local indisponível no preview web"
+                      : "Sem transcrição automática registrada";
           const selected = editor.selection.assetId === asset.id;
           return (
             <article
@@ -375,7 +482,7 @@ function MediaPanel() {
             >
               <div className="asset-thumb"><Icon name={asset.codec?.startsWith("audio") ? "audio" : "video"} /></div>
               <div className="asset-meta"><strong>{asset.name}</strong><span>{asset.offline ? "OFFLINE · clique para relink" : `${formatTimecode(asset.durationTicks)} · ${asset.width && asset.height ? `${asset.width}×${asset.height}` : "Áudio"}`}</span></div>
-              <div className="asset-actions"><button className={`asset-status ${asset.proxyPath ? "ready" : ""}`} disabled={asset.offline || !asset.width} onClick={(event) => { event.stopPropagation(); void createProxy(asset); }} title={asset.proxyPath ? "Proxy disponível" : "Gerar proxy 720p"} aria-label={`Gerar proxy de ${asset.name}`}><Icon name="settings" /></button><button className={`asset-status ${transcript ? "ready" : ""}`} onClick={(event) => { event.stopPropagation(); if (asset.offline) void relink(asset); else void transcribe(asset); }} title={asset.offline ? "Relink de mídia" : transcript ? "Transcrição disponível" : "Transcrever localmente"} aria-label={asset.offline ? `Relink ${asset.name}` : transcript ? "Transcrição disponível" : `Transcrever ${asset.name}`}><Icon name={asset.offline ? "open" : "transcript"} /></button></div>
+              <div className="asset-actions"><button className={`asset-status ${asset.proxyPath ? "ready" : ""}`} disabled={asset.offline || !asset.width} onClick={(event) => { event.stopPropagation(); void createProxy(asset); }} title={asset.proxyPath ? "Proxy disponível" : "Gerar proxy 720p"} aria-label={`Gerar proxy de ${asset.name}`}><Icon name="settings" /></button>{asset.offline ? <button className="asset-status" onClick={(event) => { event.stopPropagation(); void relink(asset); }} title="Relink de mídia" aria-label={`Relink ${asset.name}`}><Icon name="open" /></button> : <span className={`asset-status transcription-indicator ${transcript ? "ready" : transcriptionJob?.state ?? "idle"}`} title={transcriptionStatus} role="status" aria-label={transcriptionStatus}><Icon name="transcript" /></span>}</div>
             </article>
           );
         })}
@@ -428,6 +535,7 @@ function EffectsPanel() {
 function CaptionsPanel() {
   const editor = useEditor();
   const sequence = activeSequence(editor.project);
+  const style = sequence.captionStyle ?? DEFAULT_CAPTION_STYLE;
   const selectedAssetId = editor.selection.assetId;
   const transcript = editor.project.transcripts.find((item) => item.assetId === selectedAssetId) ?? editor.project.transcripts[0];
   const createCaptions = async () => {
@@ -445,9 +553,20 @@ function CaptionsPanel() {
   const removeCaption = async (cueId: string) => {
     await editor.commit("Excluir legenda", [{ type: "setCaptions", sequenceId: sequence.id, captions: sequence.captions.filter((item) => item.id !== cueId) }]);
   };
+  const updateStyle = async (patch: Partial<typeof style>) => {
+    await editor.commit("Estilizar legendas", [{ type: "setCaptionStyle", sequenceId: sequence.id, style: { ...style, ...patch } }]);
+  };
   return (
     <div className="panel-content captions-panel">
       <div className="panel-action-row"><button className="primary-button compact" disabled={!transcript} onClick={() => void createCaptions()}><Icon name="captions" /> Do transcript</button><button className="text-button" onClick={() => void addCaption()}><Icon name="plus" /> Manual</button></div>
+      <div className="caption-style-editor">
+        <label>Fonte<select value={style.fontFamily} onChange={(event) => void updateStyle({ fontFamily: event.target.value as typeof style.fontFamily })}><option value="modern">Moderna</option><option value="mono">Mono</option><option value="serif">Serif</option></select></label>
+        <label>Tamanho<input type="number" min="12" max="160" value={style.fontSize} onChange={(event) => void updateStyle({ fontSize: Math.max(12, Math.min(160, Number(event.target.value))) })} /></label>
+        <label>Texto<input type="color" value={style.textColor} onChange={(event) => void updateStyle({ textColor: event.target.value.toUpperCase() })} /></label>
+        <label>Posição<select value={style.position} onChange={(event) => void updateStyle({ position: event.target.value as typeof style.position })}><option value="bottom">Inferior</option><option value="center">Centro</option><option value="top">Superior</option></select></label>
+        <label className="caption-toggle"><input type="checkbox" checked={style.background} onChange={(event) => void updateStyle({ background: event.target.checked })} /> Fundo</label>
+        <label className="caption-toggle"><input type="checkbox" checked={style.uppercase} onChange={(event) => void updateStyle({ uppercase: event.target.checked })} /> Maiúsculas</label>
+      </div>
       {sequence.captions.length > 0 && <div className="caption-cue-list"><header>Legendas da sequência <span>{sequence.captions.length}</span></header>{sequence.captions.map((cue) => <article key={cue.id} onClick={() => editor.setPlayhead(cue.startTick)}><time>{formatTimecode(cue.startTick).slice(3, -3)}</time><input defaultValue={cue.text} key={`${cue.id}-${cue.text}`} onClick={(event) => event.stopPropagation()} onBlur={(event) => { if (event.target.value !== cue.text) void updateCaption(cue, event.target.value); }} aria-label={`Texto em ${formatTimecode(cue.startTick)}`} /><button className="icon-button" onClick={(event) => { event.stopPropagation(); void removeCaption(cue.id); }} aria-label="Excluir legenda"><Icon name="trash" /></button></article>)}</div>}
       {!transcript ? <div className="empty-panel"><Icon name="transcript" /><strong>Sem transcrição</strong><span>Transcreva um arquivo na aba Media.</span></div> : (
         <div className="transcript-list"><header>Transcript fonte</header>
@@ -486,7 +605,15 @@ function TransitionsPanel() {
   );
 }
 
-function LeftPanel() {
+function LeftPanel({
+  modelPath,
+  onModelPathChange,
+  scheduleAutomaticTranscription,
+}: {
+  modelPath: string;
+  onModelPathChange: (path: string) => void;
+  scheduleAutomaticTranscription: (asset: MediaAsset) => AutomaticTranscriptionDecision;
+}) {
   const editor = useEditor();
   return (
     <aside className="left-panel" aria-label="Biblioteca e ferramentas">
@@ -494,7 +621,7 @@ function LeftPanel() {
         {leftTabs.map((tab) => <button key={tab.id} className={editor.leftTab === tab.id ? "active" : ""} onClick={() => editor.setLeftTab(tab.id)} title={tab.label}><Icon name={tab.icon} /><span>{tab.label}</span></button>)}
       </nav>
       <div className="panel-heading"><h2>{leftTabs.find((tab) => tab.id === editor.leftTab)?.label}</h2><button className="icon-button" aria-label="Opções do painel"><Icon name="settings" /></button></div>
-      {editor.leftTab === "media" && <MediaPanel />}
+      {editor.leftTab === "media" && <MediaPanel modelPath={modelPath} onModelPathChange={onModelPathChange} scheduleAutomaticTranscription={scheduleAutomaticTranscription} />}
       {editor.leftTab === "effects" && <EffectsPanel />}
       {editor.leftTab === "captions" && <CaptionsPanel />}
       {editor.leftTab === "transitions" && <TransitionsPanel />}
@@ -527,37 +654,108 @@ function configureMediaElement(media: HTMLMediaElement, item: PlaybackItem, time
   }
 }
 
-function useResolvedMediaSource(asset: MediaAsset | undefined, localPath: string | undefined, blocked = false) {
-  const [loaded, setLoaded] = useState<{ path: string; url?: string; error?: string }>();
-
-  useEffect(() => {
-    if (asset?.objectUrl || !localPath || blocked || !isTauriRuntime()) return;
-    let cancelled = false;
-    let objectUrl: string | undefined;
-    void fetch(convertFileSrc(localPath))
-      .then((response) => {
-        if (!response.ok) throw new Error(`Falha ao ler mídia (${response.status})`);
-        return response.blob();
-      })
-      .then((blob) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setLoaded({ path: localPath, url: objectUrl });
-      })
-      .catch((error) => {
-        if (!cancelled) setLoaded({ path: localPath, error: errorMessage(error) });
-      });
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [asset?.objectUrl, blocked, localPath]);
-
+function resolveMediaSource(asset: MediaAsset | undefined, localPath: string | undefined, blocked = false) {
   if (asset?.objectUrl) return { source: asset.objectUrl, loading: false, error: undefined };
   if (blocked || !localPath) return { source: undefined, loading: false, error: undefined };
   if (!isTauriRuntime()) return { source: undefined, loading: false, error: undefined };
-  if (loaded?.path === localPath) return { source: loaded.url, loading: !loaded.url && !loaded.error, error: loaded.error };
-  return { source: undefined, loading: true, error: undefined };
+  return { source: convertFileSrc(localPath), loading: false, error: undefined };
+}
+
+async function createBufferedMediaUrl(path: string): Promise<string> {
+  const response = await fetch(convertFileSrc(path));
+  if (!response.ok) throw new Error(`Falha ao ler a mídia local (HTTP ${response.status})`);
+  return URL.createObjectURL(await response.blob());
+}
+
+function AuxiliaryAudio({ item, asset, timelineTick, playing, onFailure }: { item: PlaybackItem; asset: MediaAsset; timelineTick: number; playing: boolean; onFailure: (asset: MediaAsset) => void }) {
+  const mediaRef = useRef<HTMLAudioElement>(null);
+  const itemRef = useRef(item);
+  const timelineTickRef = useRef(timelineTick);
+  const failureRef = useRef(onFailure);
+  const mountedRef = useRef(true);
+  const bufferedRef = useRef<{ path: string; url: string } | undefined>(undefined);
+  const bufferAttemptsRef = useRef(new Set<string>());
+  const bufferingPathRef = useRef<string | undefined>(undefined);
+  const bufferRequestRef = useRef(0);
+  const [failedProxyPath, setFailedProxyPath] = useState<string>();
+  const [bufferedSource, setBufferedSource] = useState<{ path: string; url: string }>();
+  const localSource = asset.proxyPath && asset.proxyPath !== failedProxyPath ? asset.proxyPath : asset.path;
+  const directSource = resolveMediaSource(asset, localSource).source;
+  const source = bufferedSource && bufferedSource.path === localSource ? bufferedSource.url : directSource;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      bufferRequestRef.current += 1;
+      if (bufferedRef.current) URL.revokeObjectURL(bufferedRef.current.url);
+      bufferedRef.current = undefined;
+    };
+  }, []);
+
+  const recoverSource = useCallback((): boolean => {
+    if (!localSource || !isTauriRuntime()) return false;
+    if (bufferingPathRef.current === localSource) return true;
+    if (!bufferAttemptsRef.current.has(localSource)) {
+      bufferAttemptsRef.current.add(localSource);
+      bufferingPathRef.current = localSource;
+      const requestId = ++bufferRequestRef.current;
+      void createBufferedMediaUrl(localSource).then((url) => {
+        if (!mountedRef.current || requestId !== bufferRequestRef.current) {
+          bufferAttemptsRef.current.delete(localSource);
+          URL.revokeObjectURL(url);
+          return;
+        }
+        bufferingPathRef.current = undefined;
+        if (bufferedRef.current) {
+          bufferAttemptsRef.current.delete(bufferedRef.current.path);
+          URL.revokeObjectURL(bufferedRef.current.url);
+        }
+        const next = { path: localSource, url };
+        bufferedRef.current = next;
+        setBufferedSource(next);
+      }).catch(() => {
+        bufferAttemptsRef.current.delete(localSource);
+        if (!mountedRef.current || requestId !== bufferRequestRef.current) return;
+        bufferingPathRef.current = undefined;
+        if (asset.proxyPath === localSource && asset.path) setFailedProxyPath(asset.proxyPath);
+        else failureRef.current(asset);
+      });
+      return true;
+    }
+    if (asset.proxyPath === localSource && asset.path) {
+      setFailedProxyPath(asset.proxyPath);
+      return true;
+    }
+    return false;
+  }, [asset, localSource]);
+
+  useEffect(() => {
+    itemRef.current = item;
+    timelineTickRef.current = timelineTick;
+    failureRef.current = onFailure;
+    const media = mediaRef.current;
+    if (!media || !source) return;
+    configureMediaElement(media, item, timelineTick);
+  }, [item, onFailure, source, timelineTick]);
+
+  useEffect(() => {
+    const media = mediaRef.current;
+    if (!media || !source) return;
+    if (!playing) {
+      media.pause();
+      return;
+    }
+    configureMediaElement(media, itemRef.current, timelineTickRef.current);
+    void media.play().catch(() => {
+      if (!recoverSource()) failureRef.current(asset);
+    });
+  }, [asset, playing, recoverSource, source]);
+
+  if (!source) return null;
+  return <audio ref={mediaRef} className="auxiliary-audio" src={source} preload="auto" onError={() => {
+    if (!recoverSource()) failureRef.current(asset);
+  }} />;
 }
 
 function Viewer() {
@@ -567,36 +765,60 @@ function Viewer() {
   const playheadRef = useRef(editor.playheadTick);
   const playingRef = useRef(editor.isPlaying);
   const proxyAttemptsRef = useRef(new Set<string>());
+  const bufferedFallbackAttemptsRef = useRef(new Set<string>());
+  const bufferedSourceRef = useRef<{ path: string; url: string } | undefined>(undefined);
+  const bufferRequestRef = useRef(0);
+  const mountedRef = useRef(true);
   const proxyingRef = useRef<string | undefined>(undefined);
   const actionsRef = useRef({ setError: editor.setError, setPlaying: editor.setPlaying, setPlayhead: editor.setPlayhead, setStatus: editor.setStatus });
   const [failedProxyPath, setFailedProxyPath] = useState<string>();
+  const [bufferedSource, setBufferedSource] = useState<{ path: string; url: string }>();
   const [proxyingAssetId, setProxyingAssetId] = useState<string>();
   const [playbackError, setPlaybackError] = useState<string>();
   const [buffering, setBuffering] = useState(false);
+  const [finalFrame, setFinalFrame] = useState<{ key: string; source: string }>();
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const sequence = activeSequence(editor.project);
-  const selected = selectedClipData(editor.project, editor.selection.clipIds);
+  const captionStyle = sequence.captionStyle ?? DEFAULT_CAPTION_STYLE;
   const items = playbackItems(sequence);
-  const active = activePlaybackItem(items, editor.playheadTick);
-  const upcoming = playbackItemAtOrAfter(items, editor.playheadTick);
-  const selectedItem = selected ? { clip: selected.clip, track: selected.track, trackIndex: sequence.tracks.indexOf(selected.track) } : undefined;
-  const previewItem = active ?? selectedItem ?? upcoming;
+  const frameTick = Math.round(editor.project.settings.timebase * editor.project.settings.fpsDen / editor.project.settings.fpsNum);
+  const sequenceTicks = sequenceDuration(sequence);
+  const totalTicks = Math.max(frameTick, sequenceTicks);
+  const hasTimelineContent = sequenceTicks > 0;
+  const programItems = items.filter((item) => {
+    const itemAsset = editor.project.assets.find((candidate) => candidate.id === item.clip.assetId);
+    if (!itemAsset || itemAsset.offline) return false;
+    const visibleVideo = item.track.kind === "video" && !item.track.hidden && Boolean(itemAsset.width && itemAsset.height);
+    const audible = !item.track.muted && itemAsset.hasAudio;
+    return visibleVideo || audible;
+  });
+  const previewTick = programPreviewTick(editor.playheadTick, sequenceTicks, frameTick);
+  const activeVideo = activeVideoPlaybackItem(programItems, previewTick);
+  const activeAudio = activeAudioPlaybackItems(programItems, previewTick).filter((item) => editor.project.assets.some((asset) => asset.id === item.clip.assetId && asset.hasAudio));
+  const active = activeVideo ?? activeAudio[0];
+  const activeClipId = active?.clip.id;
+  const previewItem = active;
   const previewClip = previewItem?.clip;
-  const asset = resolvePlaybackAsset(editor.project.assets, previewClip?.assetId, editor.selection.assetId);
-  const caption = sequence.captions.find((item) => editor.playheadTick >= item.startTick && editor.playheadTick <= item.endTick);
+  const asset = resolvePlaybackAsset(editor.project.assets, previewClip?.assetId);
+  const auxiliaryAudio = activeAudio.filter((item) => item.clip.id !== active?.clip.id);
+  const caption = sequence.captions.find((item) => editor.playheadTick >= item.startTick && editor.playheadTick < item.endTick);
   const assetProxyJob = asset ? editor.jobs.find((job) => job.id === `proxy-${asset.id}` && job.state === "running") : undefined;
   const localSource = asset?.proxyPath && asset.proxyPath !== failedProxyPath ? asset.proxyPath : asset?.path;
-  const previewMedia = useResolvedMediaSource(asset, localSource, Boolean(assetProxyJob && !asset?.proxyPath));
-  const source = previewMedia.source;
-  const playbackCandidate = active ?? upcoming;
-  const playbackAsset = editor.project.assets.find((item) => item.id === playbackCandidate?.clip.assetId);
-  const playbackProxyJob = playbackAsset ? editor.jobs.find((job) => job.id === `proxy-${playbackAsset.id}` && job.state === "running") : undefined;
-  const playbackLocalSource = playbackAsset?.proxyPath && playbackAsset.proxyPath !== failedProxyPath ? playbackAsset.proxyPath : playbackAsset?.path;
-  const playbackUsesPreview = playbackAsset?.id === asset?.id;
-  const alternatePlaybackMedia = useResolvedMediaSource(playbackUsesPreview ? undefined : playbackAsset, playbackUsesPreview ? undefined : playbackLocalSource, Boolean(playbackProxyJob && !playbackAsset?.proxyPath));
-  const playbackSource = playbackUsesPreview ? source : alternatePlaybackMedia.source;
-  const sourceLoading = previewMedia.loading || (!playbackUsesPreview && alternatePlaybackMedia.loading);
-  const sourceLoadError = previewMedia.error ?? alternatePlaybackMedia.error;
+  const previewMedia = resolveMediaSource(asset, localSource, Boolean(assetProxyJob && !asset?.proxyPath));
+  const source = bufferedSource && bufferedSource.path === localSource ? bufferedSource.url : previewMedia.source;
+  const sourceLoading = Boolean(assetProxyJob);
+  const currentFrameKey = activeVideo && source ? `${activeVideo.clip.id}:${source}` : undefined;
+  const showFinalFrame = Boolean(currentFrameKey && currentFrameKey === finalFrame?.key && !editor.isPlaying);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      bufferRequestRef.current += 1;
+      if (bufferedSourceRef.current) URL.revokeObjectURL(bufferedSourceRef.current.url);
+      bufferedSourceRef.current = undefined;
+    };
+  }, []);
 
   useEffect(() => {
     playheadRef.current = editor.playheadTick;
@@ -622,7 +844,7 @@ function Viewer() {
   };
 
   const reportPlaybackFailure = (error?: unknown, mediaErrorCode?: number) => {
-    const currentAsset = resolvePlaybackAsset(editor.project.assets, active?.clip.assetId, playbackCandidate?.clip.assetId, previewItem?.clip.assetId, editor.selection.assetId);
+    const currentAsset = resolvePlaybackAsset(editor.project.assets, active?.clip.assetId, previewItem?.clip.assetId);
     const message = !isTauriRuntime() && currentAsset?.objectUrl
       ? `O navegador não consegue decodificar “${currentAsset.name}”. A geração de proxy usa o FFmpeg local e está disponível no aplicativo desktop.`
       : playbackFailureMessage(currentAsset?.name ?? "mídia", error, mediaErrorCode);
@@ -661,24 +883,77 @@ function Viewer() {
     }
   };
 
+  const bufferLocalSource = (target: MediaAsset, path: string): boolean => {
+    if (bufferedFallbackAttemptsRef.current.has(path)) return false;
+    bufferedFallbackAttemptsRef.current.add(path);
+    const requestId = ++bufferRequestRef.current;
+    setPlaybackError(undefined);
+    setBuffering(true);
+    editor.setStatus(`Preparando fallback compatível para ${target.name}`);
+    void (async () => {
+      try {
+        const url = await createBufferedMediaUrl(path);
+        if (!mountedRef.current || requestId !== bufferRequestRef.current) {
+          bufferedFallbackAttemptsRef.current.delete(path);
+          URL.revokeObjectURL(url);
+          return;
+        }
+        if (bufferedSourceRef.current) {
+          bufferedFallbackAttemptsRef.current.delete(bufferedSourceRef.current.path);
+          URL.revokeObjectURL(bufferedSourceRef.current.url);
+        }
+        const nextSource = { path, url };
+        bufferedSourceRef.current = nextSource;
+        setBufferedSource(nextSource);
+        setBuffering(false);
+        editor.setStatus("Fonte compatível pronta; retomando reprodução");
+      } catch (error) {
+        bufferedFallbackAttemptsRef.current.delete(path);
+        if (!mountedRef.current || requestId !== bufferRequestRef.current) return;
+        setBuffering(false);
+        if (target.proxyPath === path && target.path && path !== target.path) {
+          setFailedProxyPath(target.proxyPath);
+          editor.setStatus("Proxy indisponível; tentando o arquivo original");
+          return;
+        }
+        reportPlaybackFailure(error);
+      }
+    })();
+    return true;
+  };
+
   const recoverPlaybackFailure = (error?: unknown, mediaErrorCode?: number): boolean => {
-    const target = resolvePlaybackAsset(editor.project.assets, active?.clip.assetId, playbackCandidate?.clip.assetId, previewItem?.clip.assetId, editor.selection.assetId);
+    const target = resolvePlaybackAsset(editor.project.assets, active?.clip.assetId, previewItem?.clip.assetId);
     if (!target) return false;
-    if (proxyingRef.current === target.id) return true;
-    if (editor.jobs.some((job) => job.id === `proxy-${target.id}` && job.state === "running")) {
+    const unsupported = (error instanceof DOMException && error.name === "NotSupportedError") || mediaErrorCode === 4 || mediaErrorCode === 3;
+    const action = playbackRecoveryAction({
+      asset: target,
+      localSource,
+      desktop: isTauriRuntime(),
+      unsupported,
+      proxyRunning: proxyingRef.current === target.id || editor.jobs.some((job) => job.id === `proxy-${target.id}` && job.state === "running"),
+      proxyAttempted: proxyAttemptsRef.current.has(target.id),
+      bufferedAttempted: Boolean(localSource && bufferedFallbackAttemptsRef.current.has(localSource)),
+    });
+    if (action === "wait") {
       setBuffering(true);
       return true;
     }
-    const unsupported = (error instanceof DOMException && error.name === "NotSupportedError") || mediaErrorCode === 4 || mediaErrorCode === 3;
-    const legacyProxyFailed = Boolean(target.proxyPath && target.proxyPath === localSource && !isCurrentCompatibilityProxy(target.proxyPath));
-    if (unsupported && target.path && isTauriRuntime() && (!target.proxyPath || legacyProxyFailed) && !proxyAttemptsRef.current.has(target.id)) {
+    if (action === "generate-proxy") {
       void createPlaybackProxy(target);
+      return true;
+    }
+    if (action === "buffer-source" && localSource) return bufferLocalSource(target, localSource);
+    if (action === "use-original" && target.proxyPath) {
+      setFailedProxyPath(target.proxyPath);
+      actionsRef.current.setStatus("Proxy indisponível; tentando o arquivo original");
       return true;
     }
     return false;
   };
 
   const requestPlayback = (media: HTMLMediaElement, item: PlaybackItem) => {
+    setFinalFrame(undefined);
     configureMediaElement(media, item, playheadRef.current);
     setPlaybackError(undefined);
     setBuffering(media.readyState < HTMLMediaElement.HAVE_FUTURE_DATA);
@@ -694,10 +969,32 @@ function Viewer() {
       stopPlayback();
       return;
     }
-    if (!playbackCandidate || !playbackSource) {
-      const message = "Não há mídia disponível para reproduzir nesta posição da timeline.";
+    if (!hasTimelineContent) {
+      const message = "A timeline ainda não contém clipes para reproduzir.";
       setPlaybackError(message);
       editor.setError(message);
+      return;
+    }
+    if (editor.playheadTick >= sequenceTicks) {
+      setPlaybackError(undefined);
+      setFinalFrame(undefined);
+      editor.setPlayhead(0);
+      editor.setPlaying(true);
+      return;
+    }
+    if (!active) {
+      setPlaybackError(undefined);
+      setBuffering(false);
+      editor.setPlaying(true);
+      return;
+    }
+    if (!source) {
+      if (sourceLoading) {
+        setBuffering(true);
+        editor.setPlaying(true);
+        return;
+      }
+      reportPlaybackFailure();
       return;
     }
     const media = videoRef.current;
@@ -707,27 +1004,41 @@ function Viewer() {
       editor.setError(message);
       return;
     }
-    if (!active) editor.setPlayhead(playbackCandidate.clip.startTick);
-    if (media.currentSrc !== playbackSource && media.src !== playbackSource) {
-      media.src = playbackSource;
+    if (media.currentSrc !== source && media.src !== source) {
+      media.src = source;
       media.load();
     }
-    requestPlayback(media, playbackCandidate);
+    requestPlayback(media, active);
   };
 
   useEffect(() => {
-    if (!editor.isPlaying || active) return;
-    const next = playbackItemAtOrAfter(playbackItems(sequence), editor.playheadTick);
-    if (next) actionsRef.current.setPlayhead(next.clip.startTick);
-    else actionsRef.current.setPlaying(false);
-  }, [active, editor.isPlaying, editor.playheadTick, sequence]);
+    if (!editor.isPlaying || activeClipId || !hasTimelineContent || playheadRef.current >= sequenceTicks) return;
+    const startedAt = performance.now();
+    const startTick = playheadRef.current;
+    let frame = 0;
+    const advanceGap = (now: number) => {
+      const elapsedTicks = Math.round((now - startedAt) / 1_000 * editor.project.settings.timebase);
+      const nextTick = Math.min(sequenceTicks, startTick + elapsedTicks);
+      actionsRef.current.setPlayhead(nextTick);
+      if (nextTick >= sequenceTicks) actionsRef.current.setPlaying(false);
+      else frame = requestAnimationFrame(advanceGap);
+    };
+    frame = requestAnimationFrame(advanceGap);
+    return () => cancelAnimationFrame(frame);
+  }, [activeClipId, editor.isPlaying, editor.project.settings.timebase, hasTimelineContent, sequenceTicks]);
 
   useEffect(() => {
     const media = videoRef.current;
-    if (!media || !previewItem || editor.isPlaying) return;
-    configureMediaElement(media, previewItem, editor.playheadTick);
+    if (!media || !active || editor.isPlaying) return;
+    configureMediaElement(media, active, previewTick);
     media.pause();
-  }, [editor.isPlaying, editor.playheadTick, previewItem, source]);
+  }, [active, editor.isPlaying, previewTick, source]);
+
+  useEffect(() => {
+    if (hasTimelineContent && !editor.isPlaying && editor.playheadTick >= sequenceTicks) {
+      scheduleAppSurfaceRefresh(120);
+    }
+  }, [editor.isPlaying, editor.playheadTick, hasTimelineContent, sequenceTicks]);
 
   useEffect(() => {
     const media = videoRef.current;
@@ -741,12 +1052,27 @@ function Viewer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.clip.id, editor.isPlaying, source]);
 
-  const advance = (from = active ?? previewItem) => {
+  const advance = (from = active) => {
     if (!from) return;
-    const end = from.clip.startTick + from.clip.durationTicks;
-    const next = playbackItemAtOrAfter(items, end);
-    if (next) editor.setPlayhead(Math.max(end, next.clip.startTick));
-    else stopPlayback();
+    const end = Math.min(sequenceTicks, from.clip.startTick + from.clip.durationTicks);
+    editor.setPlayhead(end);
+    if (end >= sequenceTicks) stopPlayback();
+  };
+
+  const preserveFinalFrame = (media: HTMLVideoElement) => {
+    if (!currentFrameKey || media.videoWidth <= 0 || media.videoHeight <= 0) return;
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(1, 1920 / media.videoWidth);
+    canvas.width = Math.max(1, Math.round(media.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(media.videoHeight * scale));
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    try {
+      context.drawImage(media, 0, 0, canvas.width, canvas.height);
+      setFinalFrame({ key: currentFrameKey, source: canvas.toDataURL("image/jpeg", 0.92) });
+    } catch {
+      // Keep the native final frame if the media backend blocks canvas capture.
+    }
   };
 
   const transform = previewClip?.transform;
@@ -755,74 +1081,97 @@ function Viewer() {
   const transitionInOpacity = previewClip?.transitionIn ? Math.min(1, elapsed / Math.max(1, previewClip.transitionIn.durationTicks)) : 1;
   const transitionOutOpacity = previewClip?.transitionOut ? Math.min(1, remaining / Math.max(1, previewClip.transitionOut.durationTicks)) : 1;
   const transitionOpacity = Math.min(transitionInOpacity, transitionOutOpacity);
-  const frameTick = Math.round(editor.project.settings.timebase * editor.project.settings.fpsDen / editor.project.settings.fpsNum);
-  const totalTicks = Math.max(frameTick, sequenceDuration(sequence));
   const programAspect = editor.project.settings.width / editor.project.settings.height;
   const frameWidth = stageSize.width > 0 ? Math.max(1, Math.min(stageSize.width - 28, (stageSize.height - 24) * programAspect)) : undefined;
   const frameHeight = frameWidth ? frameWidth / programAspect : undefined;
+  const captionPreviewStyle: CSSProperties = {
+    color: captionStyle.textColor,
+    backgroundColor: captionStyle.background ? captionStyle.backgroundColor : "transparent",
+    fontFamily: captionStyle.fontFamily === "mono" ? '"IBM Plex Mono", monospace' : captionStyle.fontFamily === "serif" ? "Georgia, serif" : "system-ui, sans-serif",
+    fontSize: `${Math.max(10, Math.min(60, (frameHeight ?? editor.project.settings.height) * captionStyle.fontSize / editor.project.settings.height))}px`,
+    fontWeight: captionStyle.bold ? 700 : 400,
+    textTransform: captionStyle.uppercase ? "uppercase" : "none",
+    top: captionStyle.position === "top" ? "9%" : captionStyle.position === "center" ? "50%" : "auto",
+    bottom: captionStyle.position === "bottom" ? "9%" : "auto",
+    transform: captionStyle.position === "center" ? "translateY(-50%)" : undefined,
+  };
+  const programMediaStyle: CSSProperties | undefined = transform ? {
+    transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale}) rotate(${transform.rotation}deg)`,
+    opacity: transform.opacity * transitionOpacity,
+    filter: clipCssFilter(previewClip),
+    clipPath: `inset(${transform.cropTop * 100}% ${transform.cropRight * 100}% ${transform.cropBottom * 100}% ${transform.cropLeft * 100}%)`,
+  } : undefined;
   const seek = (tick: number) => {
     const bounded = Math.max(0, Math.min(totalTicks, tick));
     editor.setPlayhead(bounded);
-    const item = activePlaybackItem(items, bounded);
-    if (videoRef.current && item) configureMediaElement(videoRef.current, item, bounded);
+    const boundedPreview = programPreviewTick(bounded, sequenceTicks, frameTick);
+    const item = activePlaybackItem(programItems, boundedPreview);
+    if (videoRef.current && item) configureMediaElement(videoRef.current, item, boundedPreview);
   };
+  const pauseAndSeek = (tick: number) => {
+    setFinalFrame(undefined);
+    stopPlayback();
+    seek(tick);
+  };
+  const reportAuxiliaryFailure = (failedAsset: MediaAsset) => {
+    const message = playbackFailureMessage(failedAsset.name);
+    setPlaybackError(message);
+    actionsRef.current.setError(message);
+    actionsRef.current.setPlaying(false);
+  };
+  const inTimelineGap = hasTimelineContent && !active;
   return (
     <section className="viewer" aria-label="Monitor de programa">
-      <div className="viewer-head"><span>Programa</span><span className="viewer-source">{previewClip?.name ?? asset?.name ?? "Sem mídia"}</span><span>{editor.project.settings.width}×{editor.project.settings.height} · {editor.project.settings.fpsNum / editor.project.settings.fpsDen} fps</span></div>
+      <div className="viewer-head"><span>Programa</span><span className="viewer-source">{previewClip?.name ?? (inTimelineGap ? "Gap da timeline" : "Sem mídia")}</span><span>{editor.project.settings.width}×{editor.project.settings.height} · {editor.project.settings.fpsNum / editor.project.settings.fpsDen} fps</span></div>
       <div className="viewer-stage" ref={stageRef}>
         <div className="program-frame" style={{ width: frameWidth, height: frameHeight }}>
-          {source ? (
+          {source ? (<>
             <video
             ref={videoRef}
             src={source}
-            className={asset?.width && asset.height ? undefined : "audio-engine"}
+            className={activeVideo ? undefined : "audio-engine"}
             preload="auto"
             playsInline
             onLoadedMetadata={() => {
               const media = videoRef.current;
-              const item = active ?? previewItem;
+              const item = active;
               if (!media || !item) return;
               configureMediaElement(media, item, playheadRef.current);
-              if (playingRef.current && active) requestPlayback(media, active);
+              if (playingRef.current) requestPlayback(media, item);
             }}
             onLoadStart={() => { setPlaybackError(undefined); setBuffering(playingRef.current); }}
             onWaiting={() => setBuffering(true)}
             onCanPlay={() => setBuffering(false)}
-            onPlaying={() => { setBuffering(false); actionsRef.current.setPlaying(true); }}
+            onPlaying={() => { setFinalFrame(undefined); setBuffering(false); actionsRef.current.setPlaying(true); }}
             onError={(event) => {
               if (recoverPlaybackFailure(undefined, event.currentTarget.error?.code)) return;
-              if (asset?.proxyPath && asset.proxyPath !== failedProxyPath && asset.path) {
-                setFailedProxyPath(asset.proxyPath);
-                actionsRef.current.setStatus("Proxy indisponível; tentando o arquivo original");
-                return;
-              }
               reportPlaybackFailure(undefined, event.currentTarget.error?.code);
             }}
-            onEnded={() => advance()}
+            onEnded={(event) => { preserveFinalFrame(event.currentTarget); advance(); }}
             onTimeUpdate={(event) => {
-              if (!previewClip || !editor.isPlaying || !active) return;
-              const timelineTick = previewClip.startTick + Math.round((secondsToTicks(event.currentTarget.currentTime) - previewClip.sourceInTick) / previewClip.speed);
-              if (timelineTick >= previewClip.startTick + previewClip.durationTicks) advance();
-              else editor.setPlayhead(Math.max(previewClip.startTick, timelineTick));
+              if (!editor.isPlaying || !active) return;
+              const timelineTick = mediaSecondsToTimelineTick(active.clip, event.currentTarget.currentTime);
+              if (timelineTick >= active.clip.startTick + active.clip.durationTicks) advance(active);
+              else editor.setPlayhead(timelineTick);
             }}
-            style={transform ? {
-              transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale}) rotate(${transform.rotation}deg)`,
-              opacity: transform.opacity * transitionOpacity,
-              filter: clipCssFilter(previewClip),
-              clipPath: `inset(${transform.cropTop * 100}% ${transform.cropRight * 100}% ${transform.cropBottom * 100}% ${transform.cropLeft * 100}%)`,
-            } : undefined}
+            style={{ ...programMediaStyle, visibility: showFinalFrame ? "hidden" : undefined }}
             />
-          ) : <div className="viewer-empty"><Icon name="video" /><strong>{assetProxyJob ? "Gerando proxy compatível" : sourceLoading ? "Carregando mídia local" : "Nenhuma mídia no monitor"}</strong><span>{assetProxyJob ? "O vídeo será carregado automaticamente quando o proxy estiver pronto." : sourceLoading ? "Preparando uma fonte compatível com o monitor." : "Selecione um asset ou posicione o playhead sobre um clipe."}</span></div>}
+            {finalFrame && <img src={finalFrame.source} className={`video-snapshot ${showFinalFrame ? "visible" : ""}`} style={programMediaStyle} alt="" aria-hidden="true" />}
+          </>) : <div className="viewer-empty"><Icon name="video" /><strong>{assetProxyJob ? "Gerando proxy compatível" : inTimelineGap ? "Gap da timeline" : "Nenhuma mídia no monitor"}</strong><span>{assetProxyJob ? "O vídeo será carregado automaticamente quando o proxy estiver pronto." : inTimelineGap ? "O programa permanece preto até o próximo clipe." : "Insira uma mídia na timeline para iniciar a edição."}</span></div>}
           {source && asset && !asset.width && <div className="viewer-audio"><Icon name="audio" /><strong>{asset.name}</strong><span>Pré-visualização de áudio</span></div>}
+          {auxiliaryAudio.map((item) => {
+            const audioAsset = editor.project.assets.find((candidate) => candidate.id === item.clip.assetId);
+            return audioAsset ? <AuxiliaryAudio key={item.clip.id} item={item} asset={audioAsset} timelineTick={editor.playheadTick} playing={editor.isPlaying} onFailure={reportAuxiliaryFailure} /> : null;
+          })}
           {(buffering || assetProxyJob || sourceLoading) && <div className="viewer-buffering" role="status"><span /> {proxyingAssetId || assetProxyJob ? "Gerando proxy compatível" : "Preparando mídia"}</div>}
-          {(playbackError || sourceLoadError) && <div className="viewer-error" role="alert"><strong>Falha na reprodução</strong><span>{playbackError ?? `Não foi possível carregar a mídia local: ${sourceLoadError}`}</span><button className="text-button" onClick={togglePlayback}>Tentar novamente</button></div>}
-          {caption && <div className="caption-preview">{caption.text}</div>}
+          {playbackError && <div className="viewer-error" role="alert"><strong>Falha na reprodução</strong><span>{playbackError}</span><button className="text-button" onClick={togglePlayback}>Tentar novamente</button></div>}
+          {caption && <div className="caption-preview" style={captionPreviewStyle}>{caption.text}</div>}
           <div className="safe-area" aria-hidden="true" />
         </div>
       </div>
       <div className="transport">
-        <div className="transport-controls"><button className="icon-button" onClick={() => seek(editor.playheadTick - frameTick)} aria-label="Frame anterior" title="Frame anterior">−1</button><button className="transport-play" onClick={togglePlayback} disabled={!playbackCandidate || !playbackSource} aria-label={editor.isPlaying ? "Pausar" : "Reproduzir vídeo"} title={editor.isPlaying ? "Pausar (Espaço)" : "Reproduzir vídeo (Espaço)"}><Icon name={editor.isPlaying ? "pause" : "play"} /></button><button className="icon-button" onClick={() => seek(editor.playheadTick + frameTick)} aria-label="Próximo frame" title="Próximo frame">+1</button></div>
-        <label className="program-scrubber"><span className="sr-only">Posição da reprodução</span><input type="range" min={0} max={totalTicks} step={frameTick} value={Math.min(editor.playheadTick, totalTicks)} onPointerDown={stopPlayback} onChange={(event) => seek(Number(event.target.value))} /></label>
+        <div className="transport-controls"><button className="icon-button" onClick={() => pauseAndSeek(editor.playheadTick - frameTick)} aria-label="Frame anterior" title="Frame anterior">−1</button><button className="transport-play" onClick={togglePlayback} disabled={!hasTimelineContent} aria-label={editor.isPlaying ? "Pausar" : "Reproduzir vídeo"} title={editor.isPlaying ? "Pausar (Espaço)" : "Reproduzir vídeo (Espaço)"}><Icon name={editor.isPlaying ? "pause" : "play"} /></button><button className="icon-button" onClick={() => pauseAndSeek(editor.playheadTick + frameTick)} aria-label="Próximo frame" title="Próximo frame">+1</button></div>
+        <label className="program-scrubber"><span className="sr-only">Posição da reprodução</span><input type="range" min={0} max={totalTicks} step={frameTick} value={Math.min(editor.playheadTick, totalTicks)} onPointerDown={stopPlayback} onChange={(event) => pauseAndSeek(Number(event.target.value))} /></label>
         <div className="transport-time"><span className="timecode">{formatTimecode(editor.playheadTick, editor.project.settings.fpsNum, editor.project.settings.fpsDen)}</span><span>/ {formatTimecode(totalTicks, editor.project.settings.fpsNum, editor.project.settings.fpsDen)}</span></div>
       </div>
     </section>
@@ -853,7 +1202,6 @@ function InspectorPanel() {
   );
 }
 
-const visualTerms = ["olhar", "rosto", "cor do", "aparece", "imagem", "enquadramento", "objeto"];
 const chatStarters = [
   "Corte a introdução",
   "Remova as pausas longas",
@@ -901,15 +1249,10 @@ function ChatPanel() {
     const total = sequenceDuration(activeSequence(editor.project));
     const steps = [
       { id: createId("step"), label: "Ler transcript e timeline", state: "running" as const, range: { startTick: 0, endTick: total } },
-      { id: createId("step"), label: "Planejar operações", state: "queued" as const },
+      { id: createId("step"), label: "Decidir próximo passo", state: "queued" as const },
       { id: createId("step"), label: "Aplicar transação", state: "queued" as const },
     ];
     editor.setAgentSteps(steps);
-    if (visualTerms.some((term) => text.toLowerCase().includes(term))) {
-      editor.setAgentSteps(steps.map((step) => ({ ...step, state: "failed" as const })));
-      editor.addMessage("assistant", "Esse pedido depende de contexto visual. O agente atual trabalha apenas com transcript, metadata e timeline; nenhuma mídia foi enviada ao modelo.");
-      return;
-    }
     if (!isTauriRuntime()) {
       editor.setAgentSteps(steps.map((step, index) => ({ ...step, state: index === 0 ? "completed" as const : "cancelled" as const })));
       editor.addMessage("assistant", "A interface está em modo web. Execute o aplicativo Tauri e configure a chave Gemini para aplicar edições pelo agente.");
@@ -917,10 +1260,20 @@ function ChatPanel() {
     }
     try {
       editor.setAgentSteps(steps.map((step, index) => ({ ...step, state: index === 1 ? "running" as const : index < 1 ? "completed" as const : step.state })));
-      const plan = await nativeApi.planEdit(text, editor.project, editor.messages);
+      const plan = await nativeApi.planEdit(resolveRetryPrompt(text, editor.messages), editor.project, editor.messages, editor.selection);
       if (cancelledRef.current) {
         editor.setAgentSteps(steps.map((step) => ({ ...step, state: "cancelled" as const })));
         editor.addMessage("assistant", "Operação cancelada antes de alterar a timeline.");
+        return;
+      }
+      if (plan.question) {
+        editor.setAgentSteps(steps.map((step, index) => ({
+          ...step,
+          label: index === 2 ? "Pergunta enviada" : step.label,
+          state: "completed" as const,
+        })));
+        editor.addMessage("assistant", formatAgentQuestion(plan.question));
+        requestAnimationFrame(() => composerRef.current?.focus());
         return;
       }
       editor.setAgentSteps(steps.map((step, index) => ({ ...step, state: index === 2 ? "running" as const : index < 2 ? "completed" as const : step.state })));
@@ -945,7 +1298,7 @@ function ChatPanel() {
       </div>
       <div ref={messagesRef} className="messages" aria-live="polite">
         {editor.messages.length === 0 && <div className="empty-chat">
-          <div className="empty-chat-intro"><span className="empty-chat-icon"><Icon name="chat" /></span><div><strong>Descreva a edição</strong><p>O agente usa a transcrição, a seleção e a timeline. Áudio e vídeo permanecem locais.</p></div></div>
+          <div className="empty-chat-intro"><span className="empty-chat-icon"><Icon name="chat" /></span><div><strong>Descreva a edição</strong><p>O agente usa a transcrição, a seleção e a timeline. Se faltar uma decisão importante, ele pergunta antes de editar.</p></div></div>
           <div className="chat-starters"><span>Experimente</span>{chatStarters.map((starter) => <button key={starter} type="button" className="chat-starter" onClick={() => fillStarter(starter)}>{starter}</button>)}</div>
         </div>}
         {editor.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "Você" : message.role === "assistant" ? "Gemini" : "Sistema"}</span><p>{message.text}</p></article>)}
@@ -983,6 +1336,14 @@ function StatusBar() {
 export function Workspace() {
   const editor = useEditor();
   const workspaceRef = useRef<HTMLElement>(null);
+  const [modelPath, setModelPath] = useState(() => localStorage.getItem("whisperModelPath") ?? "");
+  const { schedule: scheduleAutomaticTranscription, resumePending } = useAutomaticTranscription(editor, modelPath);
+  const updateModelPath = useCallback((path: string) => {
+    if (path) localStorage.setItem("whisperModelPath", path);
+    else localStorage.removeItem("whisperModelPath");
+    setModelPath(path);
+    resumePending(path);
+  }, [resumePending]);
   const [layout, setLayout] = useState(() => ({ left: window.innerWidth <= 1280 ? 235 : 280, right: window.innerWidth <= 1280 ? 315 : 360, upper: undefined as number | undefined }));
   const resizeBy = (edge: "left" | "right" | "horizontal", delta: number) => {
     const height = workspaceRef.current?.clientHeight ?? 700;
@@ -1037,7 +1398,7 @@ export function Workspace() {
     <div className="app-shell">
       <TopBar />
       <main ref={workspaceRef} className="workspace-grid" style={{ "--left-panel": `${layout.left}px`, "--right-panel": `${layout.right}px`, "--upper-height": layout.upper ? `${layout.upper}px` : "53%" } as CSSProperties}>
-        <LeftPanel />
+        <LeftPanel modelPath={modelPath} onModelPathChange={updateModelPath} scheduleAutomaticTranscription={scheduleAutomaticTranscription} />
         <Viewer />
         <RightPanel />
         <Timeline />

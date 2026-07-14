@@ -6,13 +6,13 @@ Editor não linear desktop, local-first, construído com Tauri 2, React, Tailwin
 
 - importação e probe real de vídeo/áudio com FFprobe;
 - media bin com busca, waveform, relink e proxy 720p;
-- timeline Canvas virtualizada com múltiplas faixas, snap por frame, move, trim de entrada/saída, split, duplicação, multi-seleção, ripple delete, lock, mute e visibilidade;
-- monitor de programa com velocidade, transform, crop, opacity, efeitos e legendas;
+- timeline Canvas virtualizada por viewport, com scrollbars próprias de custo constante, múltiplas faixas, scrub na régua, snap por frame, auto-follow, move, trim de entrada/saída, split, duplicação, multi-seleção, ripple delete, lock, mute e visibilidade;
+- monitor de programa sincronizado à timeline, com último quadro preservado no fim da sequência, gaps pretos, mix de faixas de áudio ativas, seek por frame, velocidade, transform, crop, opacity, efeitos, legendas e recuperação automática por proxy/Blob/original;
 - efeitos de exposição, contraste, saturação, temperatura, chroma key e blur;
 - transições de entrada/saída, incluindo dissolve, dip, slide e crossfade de áudio;
 - legendas geradas da transcrição ou editadas manualmente;
-- transcrição totalmente local via `whisper.cpp`, com timestamps normalizados para uma timebase de 240.000 ticks/s;
-- agente Gemini conversacional com function calling, validação de IDs, transações atômicas, limite de operações e rejeição de pedidos que exigem visão;
+- transcrição automática após a importação, executada localmente e em fila serial pelo `whisper.cpp`; imports aguardam um modelo ativo sem bloquear a mídia e os timestamps são normalizados para uma timebase de 240.000 ticks/s;
+- agente Gemini conversacional com function calling, perguntas de esclarecimento sem mutação, inferência do alvo pela seleção ou pelo único clipe, operações de intenção para remover pausas, reenquadrar o canvas e estilizar legendas, transações atômicas e retry de falhas transitórias;
 - undo/redo compartilhado entre React e Rust, autosave e projetos `.aivedit` versionados;
 - exportação FFmpeg H.264/AAC com múltiplas faixas, gaps, transforms, efeitos, velocidade, mixagem, transições, legendas queimadas, progresso e cancelamento.
 
@@ -52,7 +52,7 @@ GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-3.5-flash
 ```
 
-O adaptador usa `gemini-3.5-flash` por padrão e permite sobrescrever o modelo sem alterar o código. O payload contém transcript, IDs, ticks, propriedades de timeline e as últimas mensagens; não contém bytes de áudio/vídeo, thumbnails, waveforms, proxies ou caminhos de arquivo.
+O adaptador usa `gemini-3.5-flash` por padrão e permite sobrescrever o modelo sem alterar o código. Em cada turno, o Gemini deve escolher uma única ação: aplicar operações validadas ou fazer uma pergunta curta quando faltar uma decisão que alteraria materialmente a edição. Perguntas não modificam o projeto; a resposta segue pelo chat e entra no histórico do turno seguinte. Pedidos curtos de retry, como “tente novamente”, reutilizam a última solicitação substantiva; HTTP 408/429/5xx e falhas temporárias de conexão usam backoff exponencial limitado. O payload contém transcript, seleção, IDs, ticks, propriedades completas da timeline e as últimas mensagens; não contém bytes de áudio/vídeo, thumbnails, waveforms, proxies ou caminhos de arquivo.
 
 ## Atalhos
 
@@ -75,7 +75,7 @@ bun run typecheck
 bun run test
 bun run test:rust
 bun run build
-bun run tauri build -- --no-bundle
+bun run tauri build --no-bundle
 ```
 
 Os testes Rust incluem uma renderização sintética real com FFmpeg, além de testes do grafo, transcrição, validação do agente, atomicidade e persistência temporal.

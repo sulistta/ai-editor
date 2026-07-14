@@ -126,6 +126,34 @@ pub struct CaptionCue {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionStyle {
+    pub font_family: String,
+    pub font_size: u32,
+    pub text_color: String,
+    pub background: bool,
+    pub background_color: String,
+    pub uppercase: bool,
+    pub bold: bool,
+    pub position: String,
+}
+
+impl Default for CaptionStyle {
+    fn default() -> Self {
+        Self {
+            font_family: "modern".into(),
+            font_size: 48,
+            text_color: "#FFFFFF".into(),
+            background: true,
+            background_color: "#000000".into(),
+            uppercase: false,
+            bold: true,
+            position: "bottom".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sequence {
@@ -134,6 +162,8 @@ pub struct Sequence {
     pub tracks: Vec<TimelineTrack>,
     pub markers: Vec<Marker>,
     pub captions: Vec<CaptionCue>,
+    #[serde(default)]
+    pub caption_style: CaptionStyle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +232,7 @@ impl EditorProject {
                 ],
                 markers: Vec::new(),
                 captions: Vec::new(),
+                caption_style: CaptionStyle::default(),
             }],
             active_sequence_id: sequence_id,
             transcripts: Vec::new(),
@@ -217,10 +248,20 @@ impl EditorProject {
     }
 }
 
+fn valid_caption_style(style: &CaptionStyle) -> bool {
+    let valid_color = |value: &str| value.len() == 7 && value.starts_with('#') && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    matches!(style.font_family.as_str(), "modern" | "mono" | "serif")
+        && (12..=160).contains(&style.font_size)
+        && valid_color(&style.text_color)
+        && valid_color(&style.background_color)
+        && matches!(style.position.as_str(), "top" | "center" | "bottom")
+}
+
 fn validate_project(project: &EditorProject) -> Result<(), AppError> {
     if project.schema_version != 1 { return Err(AppError::new("UNSUPPORTED_SCHEMA", "Versão do projeto não suportada")); }
     if project.settings.timebase != TICKS_PER_SECOND { return Err(AppError::new("INVALID_TIMEBASE", "O projeto usa uma base temporal incompatível")); }
     let sequence = project.active_sequence().ok_or_else(|| AppError::new("SEQUENCE_NOT_FOUND", "A sequência ativa não existe"))?;
+    if !valid_caption_style(&sequence.caption_style) { return Err(AppError::new("INVALID_CAPTION_STYLE", "Estilo de legenda inválido")); }
     for track in &sequence.tracks {
         if !matches!(track.kind.as_str(), "video" | "audio" | "caption") { return Err(AppError::new("INVALID_TRACK_KIND", format!("Tipo de faixa inválido: {}", track.kind))); }
         for clip in &track.clips {
@@ -257,6 +298,7 @@ pub enum EditCommand {
     UpdateClip { track_id: String, clip_id: String, patch: Value },
     SetTranscript { transcript: Transcript },
     SetCaptions { sequence_id: String, captions: Vec<CaptionCue> },
+    SetCaptionStyle { sequence_id: String, style: CaptionStyle },
     AddTrack { sequence_id: String, track: TimelineTrack },
     UpdateTrack { sequence_id: String, track_id: String, patch: Value },
 }
@@ -315,6 +357,11 @@ pub fn apply_command(project: &mut EditorProject, command: EditCommand) -> Resul
         EditCommand::SetCaptions { sequence_id, captions } => {
             let sequence = project.sequences.iter_mut().find(|item| item.id == sequence_id).ok_or_else(|| AppError::new("SEQUENCE_NOT_FOUND", "Sequência não encontrada"))?;
             sequence.captions = captions;
+        }
+        EditCommand::SetCaptionStyle { sequence_id, style } => {
+            if !valid_caption_style(&style) { return Err(AppError::new("INVALID_CAPTION_STYLE", "Estilo de legenda inválido")); }
+            let sequence = project.sequences.iter_mut().find(|item| item.id == sequence_id).ok_or_else(|| AppError::new("SEQUENCE_NOT_FOUND", "Sequência não encontrada"))?;
+            sequence.caption_style = style;
         }
         EditCommand::AddTrack { sequence_id, track } => {
             let sequence = project.sequences.iter_mut().find(|item| item.id == sequence_id).ok_or_else(|| AppError::new("SEQUENCE_NOT_FOUND", "Sequência não encontrada"))?;

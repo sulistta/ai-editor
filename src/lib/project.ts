@@ -23,6 +23,17 @@ export const EMPTY_TRANSFORM = {
   cropLeft: 0,
 };
 
+export const DEFAULT_CAPTION_STYLE = {
+  fontFamily: "modern",
+  fontSize: 48,
+  textColor: "#FFFFFF",
+  background: true,
+  backgroundColor: "#000000",
+  uppercase: false,
+  bold: true,
+  position: "bottom",
+} as const;
+
 export function createId(prefix: string): string {
   const random = typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
@@ -50,7 +61,7 @@ export function createEmptyProject(name = "Projeto sem título"): EditorProject 
       timebase: TICKS_PER_SECOND,
     },
     assets: [],
-    sequences: [{ id: sequenceId, name: "Sequência 01", tracks, markers: [], captions: [] }],
+    sequences: [{ id: sequenceId, name: "Sequência 01", tracks, markers: [], captions: [], captionStyle: { ...DEFAULT_CAPTION_STYLE } }],
     activeSequenceId: sequenceId,
     transcripts: [],
   };
@@ -130,6 +141,11 @@ function applyCommand(project: EditorProject, command: EditCommand): void {
   if (command.type === "setCaptions") {
     const target = project.sequences.find((item) => item.id === command.sequenceId);
     if (target) target.captions = command.captions;
+    return;
+  }
+  if (command.type === "setCaptionStyle") {
+    const target = project.sequences.find((item) => item.id === command.sequenceId);
+    if (target) target.captionStyle = command.style;
     return;
   }
   if (command.type === "addTrack") {

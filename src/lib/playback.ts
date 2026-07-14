@@ -1,5 +1,5 @@
 import type { MediaAsset, Sequence, TimelineClip, TimelineTrack } from "../types";
-import { ticksToSeconds } from "./time";
+import { secondsToTicks, ticksToSeconds } from "./time";
 
 export interface PlaybackItem {
   clip: TimelineClip;
@@ -16,9 +16,22 @@ export function playbackItems(sequence: Sequence): PlaybackItem[] {
 }
 
 export function activePlaybackItem(items: PlaybackItem[], tick: number): PlaybackItem | undefined {
-  const active = items.filter(({ clip }) => tick >= clip.startTick && tick < clip.startTick + clip.durationTicks);
-  const video = active.filter(({ track }) => track.kind === "video").sort((left, right) => right.trackIndex - left.trackIndex)[0];
-  return video ?? active.find(({ track }) => track.kind === "audio" && !track.muted) ?? active[0];
+  const active = activeItems(items, tick);
+  return activeVideoPlaybackItem(active, tick) ?? activeAudioPlaybackItems(active, tick)[0] ?? active[0];
+}
+
+function activeItems(items: PlaybackItem[], tick: number): PlaybackItem[] {
+  return items.filter(({ clip }) => tick >= clip.startTick && tick < clip.startTick + clip.durationTicks);
+}
+
+export function activeVideoPlaybackItem(items: PlaybackItem[], tick: number): PlaybackItem | undefined {
+  return activeItems(items, tick)
+    .filter(({ track }) => track.kind === "video" && !track.hidden)
+    .sort((left, right) => right.trackIndex - left.trackIndex)[0];
+}
+
+export function activeAudioPlaybackItems(items: PlaybackItem[], tick: number): PlaybackItem[] {
+  return activeItems(items, tick).filter(({ track }) => !track.muted && (track.kind === "video" || track.kind === "audio"));
 }
 
 export function playbackItemAtOrAfter(items: PlaybackItem[], tick: number): PlaybackItem | undefined {
@@ -35,8 +48,19 @@ export function resolvePlaybackAsset(assets: MediaAsset[], ...candidateIds: Arra
 }
 
 export function timelineTickToMediaSeconds(clip: TimelineClip, timelineTick: number): number {
-  const elapsed = Math.max(0, timelineTick - clip.startTick);
+  const elapsed = Math.min(clip.durationTicks, Math.max(0, timelineTick - clip.startTick));
   return ticksToSeconds(clip.sourceInTick + Math.round(elapsed * clip.speed));
+}
+
+export function mediaSecondsToTimelineTick(clip: TimelineClip, mediaSeconds: number): number {
+  const sourceTick = secondsToTicks(Math.max(0, mediaSeconds));
+  const elapsed = Math.round((sourceTick - clip.sourceInTick) / clip.speed);
+  return clip.startTick + Math.min(clip.durationTicks, Math.max(0, elapsed));
+}
+
+export function programPreviewTick(playheadTick: number, sequenceTicks: number, frameTick: number): number {
+  if (sequenceTicks <= 0 || playheadTick < sequenceTicks) return Math.max(0, playheadTick);
+  return Math.max(0, sequenceTicks - Math.max(1, frameTick));
 }
 
 export function mediaVolume(clip: TimelineClip, track: TimelineTrack): { muted: boolean; volume: number } {
@@ -54,6 +78,34 @@ export function needsCompatibilityProxy(asset: Pick<MediaAsset, "codec" | "width
 
 export function isCurrentCompatibilityProxy(path: string | undefined): boolean {
   return path?.toLowerCase().endsWith(".proxy-v3.mp4") ?? false;
+}
+
+export type PlaybackRecoveryAction = "wait" | "generate-proxy" | "buffer-source" | "use-original" | "fail";
+
+export function playbackRecoveryAction({
+  asset,
+  localSource,
+  desktop,
+  unsupported,
+  proxyRunning = false,
+  proxyAttempted = false,
+  bufferedAttempted = false,
+}: {
+  asset?: Pick<MediaAsset, "path" | "proxyPath">;
+  localSource?: string;
+  desktop: boolean;
+  unsupported: boolean;
+  proxyRunning?: boolean;
+  proxyAttempted?: boolean;
+  bufferedAttempted?: boolean;
+}): PlaybackRecoveryAction {
+  if (proxyRunning) return "wait";
+  if (!asset || !unsupported) return "fail";
+  const legacyProxyFailed = Boolean(asset.proxyPath && asset.proxyPath === localSource && !isCurrentCompatibilityProxy(asset.proxyPath));
+  if (desktop && asset.path && (!asset.proxyPath || legacyProxyFailed) && !proxyAttempted) return "generate-proxy";
+  if (desktop && localSource && !bufferedAttempted) return "buffer-source";
+  if (asset.proxyPath && asset.proxyPath === localSource && asset.path) return "use-original";
+  return "fail";
 }
 
 export function playbackFailureMessage(assetName: string, error?: unknown, mediaErrorCode?: number): string {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Sequence, TimelineClip, TimelineTrack } from "../types";
-import { activePlaybackItem, isCurrentCompatibilityProxy, mediaVolume, needsCompatibilityProxy, playbackFailureMessage, playbackItemAtOrAfter, playbackItems, resolvePlaybackAsset, timelineTickToMediaSeconds } from "./playback";
+import { activeAudioPlaybackItems, activePlaybackItem, activeVideoPlaybackItem, isCurrentCompatibilityProxy, mediaSecondsToTimelineTick, mediaVolume, needsCompatibilityProxy, playbackFailureMessage, playbackItemAtOrAfter, playbackItems, playbackRecoveryAction, programPreviewTick, resolvePlaybackAsset, timelineTickToMediaSeconds } from "./playback";
 
 function clip(id: string, startTick = 0, durationTicks = 240_000): TimelineClip {
   return {
@@ -22,7 +22,7 @@ function track(id: string, kind: TimelineTrack["kind"], clips: TimelineClip[], p
 }
 
 function sequence(tracks: TimelineTrack[]): Sequence {
-  return { id: "sequence", name: "Sequence", tracks, markers: [], captions: [] };
+  return { id: "sequence", name: "Sequence", tracks, markers: [], captions: [], captionStyle: { fontFamily: "modern", fontSize: 48, textColor: "#FFFFFF", background: true, backgroundColor: "#000000", uppercase: false, bold: true, position: "bottom" } };
 }
 
 describe("playback selection", () => {
@@ -43,6 +43,17 @@ describe("playback selection", () => {
     expect(activePlaybackItem(items, 1)?.clip.id).toBe("audio");
   });
 
+  it("separates the visible program layer from every audible layer", () => {
+    const items = playbackItems(sequence([
+      track("video-low", "video", [clip("video-low")]),
+      track("audio", "audio", [clip("audio")]),
+      track("muted-audio", "audio", [clip("muted-audio")], { muted: true }),
+      track("video-high", "video", [clip("video-high")]),
+    ]));
+    expect(activeVideoPlaybackItem(items, 1)?.clip.id).toBe("video-high");
+    expect(activeAudioPlaybackItems(items, 1).map((item) => item.clip.id)).toEqual(["video-low", "audio", "video-high"]);
+  });
+
   it("finds the next clip when the playhead is in a gap", () => {
     const items = playbackItems(sequence([track("video", "video", [clip("later", 480_000)])]));
     expect(playbackItemAtOrAfter(items, 240_000)?.clip.id).toBe("later");
@@ -57,6 +68,24 @@ describe("playback selection", () => {
 describe("playback media mapping", () => {
   it("maps timeline time through source in and speed", () => {
     expect(timelineTickToMediaSeconds(clip("mapped"), 60_000)).toBe(1);
+  });
+
+  it("clamps mapping to the clip source window", () => {
+    const item = clip("bounded");
+    expect(timelineTickToMediaSeconds(item, -10)).toBe(0.5);
+    expect(timelineTickToMediaSeconds(item, 480_000)).toBe(2.5);
+  });
+
+  it("maps media time back to a bounded timeline tick", () => {
+    const item = clip("inverse");
+    expect(mediaSecondsToTimelineTick(item, 1)).toBe(60_000);
+    expect(mediaSecondsToTimelineTick(item, -1)).toBe(0);
+    expect(mediaSecondsToTimelineTick(item, 100)).toBe(240_000);
+  });
+
+  it("keeps the final frame mounted when the playhead reaches the sequence end", () => {
+    expect(programPreviewTick(2_400_000, 2_400_000, 8_000)).toBe(2_392_000);
+    expect(programPreviewTick(1_200_000, 2_400_000, 8_000)).toBe(1_200_000);
   });
 
   it("applies track mute and clamps HTML media volume", () => {
@@ -79,5 +108,16 @@ describe("playback media mapping", () => {
   it("recognizes only the current H.264 proxy generation", () => {
     expect(isCurrentCompatibilityProxy("/cache/media.proxy-v3.mp4")).toBe(true);
     expect(isCurrentCompatibilityProxy("/cache/media.proxy-v2.webm")).toBe(false);
+  });
+
+  it("buffers a valid current proxy when WebKit rejects the asset protocol", () => {
+    const asset = { id: "asset", name: "clip.mp4", path: "/media/clip.mp4", proxyPath: "/cache/clip.proxy-v3.mp4", durationTicks: 1, hasAudio: true, offline: false };
+    expect(playbackRecoveryAction({ asset, localSource: asset.proxyPath, desktop: true, unsupported: true })).toBe("buffer-source");
+    expect(playbackRecoveryAction({ asset, localSource: asset.proxyPath, desktop: true, unsupported: true, bufferedAttempted: true })).toBe("use-original");
+  });
+
+  it("regenerates legacy proxies before falling back to buffering", () => {
+    const asset = { id: "asset", name: "clip.mp4", path: "/media/clip.mp4", proxyPath: "/cache/clip.proxy-v2.webm", durationTicks: 1, hasAudio: true, offline: false };
+    expect(playbackRecoveryAction({ asset, localSource: asset.proxyPath, desktop: true, unsupported: true })).toBe("generate-proxy");
   });
 });

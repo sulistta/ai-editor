@@ -93,12 +93,24 @@ export interface CaptionCue {
   text: string;
 }
 
+export interface CaptionStyle {
+  fontFamily: "modern" | "mono" | "serif";
+  fontSize: number;
+  textColor: string;
+  background: boolean;
+  backgroundColor: string;
+  uppercase: boolean;
+  bold: boolean;
+  position: "top" | "center" | "bottom";
+}
+
 export interface Sequence {
   id: string;
   name: string;
   tracks: TimelineTrack[];
   markers: Marker[];
   captions: CaptionCue[];
+  captionStyle: CaptionStyle;
 }
 
 export interface TranscriptWord {
@@ -182,6 +194,7 @@ export type EditCommand =
   | { type: "updateClip"; trackId: string; clipId: string; patch: Partial<TimelineClip> }
   | { type: "setTranscript"; transcript: Transcript }
   | { type: "setCaptions"; sequenceId: string; captions: CaptionCue[] }
+  | { type: "setCaptionStyle"; sequenceId: string; style: CaptionStyle }
   | { type: "addTrack"; sequenceId: string; track: TimelineTrack }
   | { type: "updateTrack"; sequenceId: string; trackId: string; patch: Partial<Pick<TimelineTrack, "name" | "locked" | "muted" | "hidden">> };
 
@@ -217,9 +230,16 @@ export interface TranscriptionRequest {
   language?: string;
 }
 
+export interface AgentQuestion {
+  text: string;
+  context?: string;
+  options: string[];
+}
+
 export interface GeminiPlan {
   message: string;
   operations: EditCommand[];
+  question?: AgentQuestion;
 }
 
 export interface DependencyStatus {

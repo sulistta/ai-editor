@@ -67,6 +67,33 @@ fn filter_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").replace(':', "\\:").replace('\'', "\\'")
 }
 
+fn ass_color(value: &str, alpha: &str) -> String {
+    let value = value.strip_prefix('#').unwrap_or("FFFFFF");
+    if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) { return format!("&H{alpha}FFFFFF"); }
+    format!("&H{alpha}{}{}{}", &value[4..6], &value[2..4], &value[0..2])
+}
+
+fn subtitle_force_style(project: &EditorProject) -> Result<String, AppError> {
+    let style = &project.active_sequence().ok_or_else(|| AppError::new("SEQUENCE_NOT_FOUND", "Sequência ativa não encontrada"))?.caption_style;
+    let font = match style.font_family.as_str() {
+        "mono" => "IBM Plex Mono",
+        "serif" => "DejaVu Serif",
+        _ => "DejaVu Sans",
+    };
+    let alignment = match style.position.as_str() { "top" => 8, "center" => 5, _ => 2 };
+    let (border_style, outline, back_color) = if style.background {
+        (3, 0, ass_color(&style.background_color, "60"))
+    } else {
+        (1, 2, ass_color(&style.background_color, "FF"))
+    };
+    Ok(format!(
+        "FontName={font},FontSize={},PrimaryColour={},BackColour={back_color},BorderStyle={border_style},Outline={outline},OutlineColour=&H90000000,Shadow=0,Bold={},Alignment={alignment},MarginV=48",
+        style.font_size,
+        ass_color(&style.text_color, "00"),
+        if style.bold { -1 } else { 0 },
+    ))
+}
+
 fn effect_filters(clip: &TimelineClip) -> Vec<String> {
     let mut filters = Vec::new();
     for effect in clip.effects.iter().filter(|effect| effect.enabled) {
@@ -193,7 +220,7 @@ fn build_render_plan(project: &EditorProject, subtitle_path: Option<&Path>) -> R
         video_output = output;
     }
     if let Some(path) = subtitle_path {
-        graph.push(format!("[{video_output}]subtitles=filename='{}':force_style='FontName=IBM Plex Mono,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=1,Shadow=0,MarginV=48'[vout]", filter_path(path)));
+        graph.push(format!("[{video_output}]subtitles=filename='{}':force_style='{}'[vout]", filter_path(path), subtitle_force_style(project)?));
     } else {
         graph.push(format!("[{video_output}]null[vout]"));
     }
@@ -220,7 +247,7 @@ fn subtitle_file(project: &EditorProject) -> Option<String> {
     let sequence = project.active_sequence()?;
     if sequence.captions.is_empty() { return None; }
     Some(sequence.captions.iter().enumerate().map(|(index, cue)| {
-        let text = cue.text.replace(['\r', '\n'], " ");
+        let text = if sequence.caption_style.uppercase { cue.text.to_uppercase() } else { cue.text.clone() }.replace(['\r', '\n'], " ");
         format!("{}\n{} --> {}\n{}\n", index + 1, srt_timestamp(cue.start_tick, project.settings.timebase), srt_timestamp(cue.end_tick, project.settings.timebase), text)
     }).collect::<Vec<_>>().join("\n"))
 }
@@ -323,6 +350,22 @@ mod tests {
         project.active_sequence_mut().unwrap().captions.push(crate::domain::CaptionCue { id: "cue".into(), start_tick: 240_000, end_tick: 600_000, text: "Legenda".into() });
         let srt = subtitle_file(&project).unwrap();
         assert!(srt.contains("00:00:01,000 --> 00:00:02,500"));
+    }
+
+    #[test]
+    fn subtitle_style_reaches_preview_equivalent_render_settings() {
+        let media_file = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
+        let mut project = project_with_clip(media_file.path());
+        let sequence = project.active_sequence_mut().unwrap();
+        sequence.captions.push(crate::domain::CaptionCue { id: "cue".into(), start_tick: 0, end_tick: 240_000, text: "Legenda moderna".into() });
+        sequence.caption_style.text_color = "#FFFF00".into();
+        sequence.caption_style.background = false;
+        sequence.caption_style.uppercase = true;
+        let srt = subtitle_file(&project).unwrap();
+        assert!(srt.contains("LEGENDA MODERNA"));
+        let plan = build_render_plan(&project, Some(Path::new("captions.srt"))).unwrap();
+        assert!(plan.filter_complex.contains("PrimaryColour=&H0000FFFF"));
+        assert!(plan.filter_complex.contains("BorderStyle=1"));
     }
 
     #[tokio::test]
