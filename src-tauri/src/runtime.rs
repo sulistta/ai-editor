@@ -56,6 +56,14 @@ pub fn ytdlp_binary(app: &tauri::AppHandle) -> PathBuf {
     PathBuf::from("yt-dlp")
 }
 
+pub fn tesseract_binary() -> PathBuf {
+    std::env::var_os("TESSERACT_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("tesseract"))
+}
+
+pub fn yolo_world_binary() -> Option<PathBuf> {
+    std::env::var_os("YOLO_WORLD_PATH").map(PathBuf::from).filter(|path| path.is_file())
+}
+
 pub fn resolve_whisper_model(requested: Option<&str>, app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
     if let Some(path) = requested.map(str::trim).filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
@@ -84,6 +92,8 @@ pub struct RuntimeStatus {
     whisper: DependencyStatus,
     model: DependencyStatus,
     youtube: DependencyStatus,
+    ocr: DependencyStatus,
+    objects: DependencyStatus,
 }
 
 async fn dependency(binary: PathBuf, version_arg: &str) -> DependencyStatus {
@@ -99,12 +109,13 @@ async fn dependency(binary: PathBuf, version_arg: &str) -> DependencyStatus {
 
 #[tauri::command]
 pub async fn runtime_status(model_path: Option<String>, app: tauri::AppHandle) -> RuntimeStatus {
-    let (ffmpeg, ffprobe, whisper, ytdlp, node) = tokio::join!(
+    let (ffmpeg, ffprobe, whisper, ytdlp, node, ocr) = tokio::join!(
         dependency(ffmpeg_binary(), "-version"),
         dependency(ffprobe_binary(), "-version"),
         dependency(whisper_binary(&app), "--help"),
         dependency(ytdlp_binary(&app), "--version"),
         dependency(PathBuf::from("node"), "--version"),
+        dependency(tesseract_binary(), "--version"),
     );
     let youtube = if ytdlp.available && node.available {
         DependencyStatus { available: true, detail: format!("yt-dlp · {}", node.detail) }
@@ -115,5 +126,9 @@ pub async fn runtime_status(model_path: Option<String>, app: tauri::AppHandle) -
         Ok(path) => DependencyStatus { available: true, detail: path.to_string_lossy().into_owned() },
         Err(error) => DependencyStatus { available: false, detail: error.message },
     };
-    RuntimeStatus { ffmpeg, ffprobe, whisper, model, youtube }
+    let objects = yolo_world_binary().map_or_else(
+        || DependencyStatus { available: false, detail: "Configure YOLO_WORLD_PATH".into() },
+        |path| DependencyStatus { available: true, detail: path.to_string_lossy().into_owned() },
+    );
+    RuntimeStatus { ffmpeg, ffprobe, whisper, model, youtube, ocr, objects }
 }

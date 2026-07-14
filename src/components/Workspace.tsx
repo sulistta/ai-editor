@@ -1,26 +1,27 @@
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useEditor } from "../context/EditorContext";
-import { formatAgentQuestion, resolveRetryPrompt } from "../lib/agent";
-import { scheduleAppSurfaceRefresh } from "../lib/compositor";
+import { type EditorActions, useEditorActions, useEditorSelector } from "../context/EditorContext";
+import { resolveRetryPrompt } from "../lib/agent";
 import { activeAudioPlaybackItems, activePlaybackItem, activeVideoPlaybackItem, mediaSecondsToTimelineTick, mediaVolume, needsCompatibilityProxy, playbackFailureMessage, playbackItems, playbackRecoveryAction, programPreviewTick, resolvePlaybackAsset, timelineTickToMediaSeconds, type PlaybackItem } from "../lib/playback";
 import { activeSequence, captionsFromTranscript, createId, DEFAULT_CAPTION_STYLE, sequenceDuration } from "../lib/project";
 import { chooseExportPath, chooseMediaPaths, chooseProjectOpenPath, chooseProjectPath, chooseWhisperModelPath, errorMessage, isTauriRuntime, nativeApi } from "../lib/tauri";
 import { formatTimecode, secondsToTicks, ticksToSeconds } from "../lib/time";
+import { transformAtTimelineTick } from "../lib/transform";
 import { autoTranscriptionDecision } from "../lib/transcription";
-import type { CaptionCue, EffectInstance, MediaAsset, RuntimeStatus, TimelineClip, WhisperModelStatus } from "../types";
+import type { AnalysisStage, CaptionCue, EditorProject, EffectInstance, MediaAsset, RuntimeStatus, TimelineClip, WhisperModelStatus } from "../types";
 import { Icon, type IconName } from "./Icons";
 import { Timeline } from "./Timeline";
 
-const leftTabs: Array<{ id: "media" | "effects" | "captions" | "transitions"; label: string; icon: IconName }> = [
-  { id: "media", label: "Media", icon: "media" },
-  { id: "effects", label: "Effects", icon: "effects" },
-  { id: "captions", label: "Captions", icon: "captions" },
-  { id: "transitions", label: "Transitions", icon: "transitions" },
+const leftTabs: Array<{ id: "media" | "analysis" | "effects" | "captions" | "transitions"; label: string; tabLabel?: string; icon: IconName }> = [
+  { id: "media", label: "Mídia", icon: "media" },
+  { id: "analysis", label: "Análise", icon: "analysis" },
+  { id: "effects", label: "Efeitos", icon: "effects" },
+  { id: "captions", label: "Legendas", icon: "captions" },
+  { id: "transitions", label: "Transições", tabLabel: "Trans.", icon: "transitions" },
 ];
 
-function selectedClipData(project: ReturnType<typeof useEditor>["project"], clipIds: string[]) {
+function selectedClipData(project: EditorProject, clipIds: string[]) {
   const sequence = activeSequence(project);
   for (const track of sequence.tracks) {
     const clip = track.clips.find((item) => clipIds.includes(item.id));
@@ -59,16 +60,18 @@ async function probeBrowserFile(file: File): Promise<MediaAsset> {
 
 type AutomaticTranscriptionDecision = ReturnType<typeof autoTranscriptionDecision>;
 
-function useAutomaticTranscription(editor: ReturnType<typeof useEditor>, modelPath: string) {
-  const editorRef = useRef(editor);
+function useAutomaticTranscription(modelPath: string) {
+  const project = useEditorSelector((state) => state.project);
+  const actions = useEditorActions();
+  const editorRef = useRef<{ project: EditorProject } & EditorActions>({ project, ...actions });
   const modelPathRef = useRef(modelPath);
   const queuedAssetsRef = useRef(new Set<string>());
   const pendingAssetsRef = useRef(new Map<string, MediaAsset>());
   const taskQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
-    editorRef.current = editor;
-  }, [editor]);
+    editorRef.current = { project, ...actions };
+  }, [actions, project]);
 
   useEffect(() => {
     modelPathRef.current = modelPath;
@@ -152,7 +155,10 @@ function useAutomaticTranscription(editor: ReturnType<typeof useEditor>, modelPa
 }
 
 function TopBar() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const canUndo = useEditorSelector((state) => state.canUndo);
+  const canRedo = useEditorSelector((state) => state.canRedo);
+  const editor = { project, canUndo, canRedo, ...useEditorActions() };
   const [rendering, setRendering] = useState(false);
   const renderCancelled = useRef(false);
 
@@ -215,8 +221,8 @@ function TopBar() {
       <div className="product-mark"><span className="mark-block" /> Editor de Vídeo</div>
       <div className="project-title"><span>{editor.project.name}</span><span className="unsaved-dot" title="Revisão atual" /></div>
       <div className="topbar-actions">
-        <button className="icon-button" onClick={() => void editor.undo()} disabled={editor.past.length === 0} title="Desfazer" aria-label="Desfazer"><Icon name="undo" /></button>
-        <button className="icon-button" onClick={() => void editor.redo()} disabled={editor.future.length === 0} title="Refazer" aria-label="Refazer"><Icon name="redo" /></button>
+        <button className="icon-button" onClick={() => void editor.undo()} disabled={!editor.canUndo} title="Desfazer" aria-label="Desfazer"><Icon name="undo" /></button>
+        <button className="icon-button" onClick={() => void editor.redo()} disabled={!editor.canRedo} title="Refazer" aria-label="Refazer"><Icon name="redo" /></button>
         <span className="topbar-divider" />
         <button className="text-button" onClick={() => void openProject()}><Icon name="open" /> Abrir</button>
         <button className="text-button" onClick={() => void saveProject()}><Icon name="save" /> Salvar</button>
@@ -235,7 +241,10 @@ function MediaPanel({
   onModelPathChange: (path: string) => void;
   scheduleAutomaticTranscription: (asset: MediaAsset) => AutomaticTranscriptionDecision;
 }) {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const jobs = useEditorSelector((state) => state.jobs);
+  const selection = useEditorSelector((state) => state.selection);
+  const editor = { project, jobs, selection, ...useEditorActions() };
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [url, setUrl] = useState("");
@@ -351,6 +360,7 @@ function MediaPanel({
       const relinkedAsset = { ...replacement, id: asset.id };
       await editor.commit("Relink de mídia", [{ type: "updateAsset", asset: relinkedAsset }]);
       scheduleImportedAsset(relinkedAsset);
+      if (relinkedAsset.width && relinkedAsset.height) void editor.startAnalysis(relinkedAsset, [], true).catch(() => undefined);
       editor.setStatus("Mídia relinkada");
     } catch (error) {
       editor.setError(errorMessage(error));
@@ -503,6 +513,61 @@ function MediaPanel({
   );
 }
 
+function sourceTickOnTimeline(project: EditorProject, assetId: string, sourceTick: number): number {
+  const placements = activeSequence(project).tracks.flatMap((track) => track.clips).filter((clip) => clip.assetId === assetId);
+  const placement = placements.find((clip) => {
+    const sourceEnd = clip.sourceInTick + Math.round(clip.durationTicks * clip.speed);
+    return sourceTick >= clip.sourceInTick && sourceTick < sourceEnd;
+  }) ?? placements[0];
+  if (!placement) return sourceTick;
+  return placement.startTick + Math.round((Math.max(sourceTick, placement.sourceInTick) - placement.sourceInTick) / placement.speed);
+}
+
+function AnalysisPanel() {
+  const project = useEditorSelector((state) => state.project);
+  const analyses = useEditorSelector((state) => state.analyses);
+  const jobs = useEditorSelector((state) => state.jobs);
+  const selection = useEditorSelector((state) => state.selection);
+  const showOverlay = useEditorSelector((state) => state.showAnalysisOverlay);
+  const editor = { project, analyses, jobs, selection, showOverlay, ...useEditorActions() };
+  const videoAssets = editor.project.assets.filter((asset) => asset.width && asset.height);
+  const [promptText, setPromptText] = useState("");
+  const assetId = videoAssets.some((asset) => asset.id === editor.selection.assetId)
+    ? editor.selection.assetId!
+    : videoAssets[0]?.id ?? "";
+  const asset = videoAssets.find((candidate) => candidate.id === assetId);
+  const analysis = asset ? editor.analyses[asset.id] : undefined;
+  const job = asset ? editor.jobs.find((candidate) => candidate.id === `analysis-${asset.id}`) : undefined;
+  const running = job?.state === "running" || job?.state === "queued";
+  const stageNames: Record<string, string> = { scenes: "Cenas", objects: "Objetos", ocr: "OCR" };
+  const observationCount = analysis?.scenes.reduce((count, scene) => count + scene.observations.length, 0) ?? 0;
+  const run = async () => {
+    if (!asset) return;
+    const prompts = promptText.split(",").map((value) => value.trim()).filter(Boolean);
+    try { await editor.startAnalysis(asset, prompts, true); }
+    catch { /* O estado global já apresenta o erro detalhado. */ }
+  };
+  if (videoAssets.length === 0) return <div className="panel-content analysis-empty"><Icon name="analysis" /><strong>Nenhum vídeo para analisar</strong><p>Importe uma mídia visual. A transcrição e a análise local serão iniciadas automaticamente.</p></div>;
+  const stages: AnalysisStage[] = analysis?.stages ?? [
+    { kind: "scenes", state: "queued", progress: 0, updatedAt: 0 },
+    { kind: "objects", state: "queued", progress: 0, updatedAt: 0 },
+    { kind: "ocr", state: "queued", progress: 0, updatedAt: 0 },
+  ];
+  return <div className="panel-content analysis-panel">
+    <div className="analysis-controls">
+      <label>Mídia<select value={assetId} onChange={(event) => editor.select({ clipIds: [], assetId: event.target.value })}>{videoAssets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+      <label>Categorias<input value={promptText} onChange={(event) => setPromptText(event.target.value)} placeholder="produto, gráfico, celular" /></label>
+      <div><button className="text-button compact" onClick={() => void run()} disabled={running}>{analysis ? "Reanalisar" : "Analisar agora"}</button>{running && asset && <button className="text-button compact" onClick={() => void editor.cancelAnalysis(asset.id)}>Cancelar</button>}<label className="analysis-overlay-toggle"><input type="checkbox" checked={editor.showOverlay} onChange={(event) => editor.setShowAnalysisOverlay(event.target.checked)} /> Sobreposição</label></div>
+    </div>
+    <div className="analysis-stages">{stages.map((stage) => <div key={stage.kind} data-state={stage.state}><header><span>{stageNames[stage.kind] ?? stage.kind}</span><small>{stage.state}</small></header><progress max={1} value={stage.progress} /><p>{stage.detail ?? "Aguardando processamento"}</p></div>)}</div>
+    <div className="analysis-summary"><span>{analysis?.scenes.length ?? 0} cenas</span><span>{observationCount} observações</span><span>{analysis?.pipelineVersion ?? "local-v1"}</span></div>
+    <div className="scene-list">{analysis?.scenes.map((scene, index) => <button key={scene.id} className="scene-card" type="button" onClick={() => editor.setPlayhead(sourceTickOnTimeline(editor.project, analysis.assetId, scene.representativeTick))}>
+      <span className="scene-thumbnail">{scene.thumbnailPath ? <img src={isTauriRuntime() ? convertFileSrc(scene.thumbnailPath) : scene.thumbnailPath} alt="" /> : <Icon name="video" />}</span>
+      <span><strong>Cena {String(index + 1).padStart(2, "0")}</strong><small>{formatTimecode(scene.startTick)}–{formatTimecode(scene.endTick)}</small><em>{scene.observations.slice(0, 3).map((observation) => observation.text ?? observation.label).join(" · ") || "Sem observações"}</em></span>
+    </button>) ?? <div className="analysis-waiting">A análise aparecerá aqui sem bloquear a edição.</div>}</div>
+  </div>;
+}
+
 const effectDefinitions: Array<{ kind: EffectInstance["kind"]; label: string; detail: string; initial: number }> = [
   { kind: "exposure", label: "Exposure", detail: "Luminância primária", initial: 0 },
   { kind: "contrast", label: "Contrast", detail: "Separação tonal", initial: 0 },
@@ -513,7 +578,9 @@ const effectDefinitions: Array<{ kind: EffectInstance["kind"]; label: string; de
 ];
 
 function EffectsPanel() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const selection = useEditorSelector((state) => state.selection);
+  const editor = { project, selection, ...useEditorActions() };
   const selected = selectedClipData(editor.project, editor.selection.clipIds);
   const addEffect = async (definition: (typeof effectDefinitions)[number]) => {
     if (!selected) return;
@@ -533,7 +600,10 @@ function EffectsPanel() {
 }
 
 function CaptionsPanel() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const selection = useEditorSelector((state) => state.selection);
+  const playheadTick = useEditorSelector((state) => state.playheadTick);
+  const editor = { project, selection, playheadTick, ...useEditorActions() };
   const sequence = activeSequence(editor.project);
   const style = sequence.captionStyle ?? DEFAULT_CAPTION_STYLE;
   const selectedAssetId = editor.selection.assetId;
@@ -568,7 +638,7 @@ function CaptionsPanel() {
         <label className="caption-toggle"><input type="checkbox" checked={style.uppercase} onChange={(event) => void updateStyle({ uppercase: event.target.checked })} /> Maiúsculas</label>
       </div>
       {sequence.captions.length > 0 && <div className="caption-cue-list"><header>Legendas da sequência <span>{sequence.captions.length}</span></header>{sequence.captions.map((cue) => <article key={cue.id} onClick={() => editor.setPlayhead(cue.startTick)}><time>{formatTimecode(cue.startTick).slice(3, -3)}</time><input defaultValue={cue.text} key={`${cue.id}-${cue.text}`} onClick={(event) => event.stopPropagation()} onBlur={(event) => { if (event.target.value !== cue.text) void updateCaption(cue, event.target.value); }} aria-label={`Texto em ${formatTimecode(cue.startTick)}`} /><button className="icon-button" onClick={(event) => { event.stopPropagation(); void removeCaption(cue.id); }} aria-label="Excluir legenda"><Icon name="trash" /></button></article>)}</div>}
-      {!transcript ? <div className="empty-panel"><Icon name="transcript" /><strong>Sem transcrição</strong><span>Transcreva um arquivo na aba Media.</span></div> : (
+      {!transcript ? <div className="empty-panel"><Icon name="transcript" /><strong>Transcrição pendente</strong><span>A transcrição é iniciada automaticamente após a importação. Verifique o modelo local na aba Media.</span></div> : (
         <div className="transcript-list"><header>Transcript fonte</header>
           {transcript.segments.map((segment) => <button key={segment.id} onClick={() => editor.setPlayhead(segment.startTick)}><time>{formatTimecode(segment.startTick).slice(3, -3)}</time><span>{segment.text}</span></button>)}
         </div>
@@ -585,7 +655,9 @@ const transitionDefinitions = [
 ] as const;
 
 function TransitionsPanel() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const selection = useEditorSelector((state) => state.selection);
+  const editor = { project, selection, ...useEditorActions() };
   const selected = selectedClipData(editor.project, editor.selection.clipIds);
   const apply = async (kind: (typeof transitionDefinitions)[number]["kind"], edge: "transitionIn" | "transitionOut") => {
     if (!selected) return;
@@ -614,14 +686,16 @@ function LeftPanel({
   onModelPathChange: (path: string) => void;
   scheduleAutomaticTranscription: (asset: MediaAsset) => AutomaticTranscriptionDecision;
 }) {
-  const editor = useEditor();
+  const leftTab = useEditorSelector((state) => state.leftTab);
+  const editor = { leftTab, ...useEditorActions() };
   return (
     <aside className="left-panel" aria-label="Biblioteca e ferramentas">
       <nav className="panel-tabs" aria-label="Ferramentas">
-        {leftTabs.map((tab) => <button key={tab.id} className={editor.leftTab === tab.id ? "active" : ""} onClick={() => editor.setLeftTab(tab.id)} title={tab.label}><Icon name={tab.icon} /><span>{tab.label}</span></button>)}
+        {leftTabs.map((tab) => <button key={tab.id} className={editor.leftTab === tab.id ? "active" : ""} onClick={() => editor.setLeftTab(tab.id)} title={tab.label} aria-label={tab.label}><Icon name={tab.icon} /><span>{tab.tabLabel ?? tab.label}</span></button>)}
       </nav>
       <div className="panel-heading"><h2>{leftTabs.find((tab) => tab.id === editor.leftTab)?.label}</h2><button className="icon-button" aria-label="Opções do painel"><Icon name="settings" /></button></div>
       {editor.leftTab === "media" && <MediaPanel modelPath={modelPath} onModelPathChange={onModelPathChange} scheduleAutomaticTranscription={scheduleAutomaticTranscription} />}
+      {editor.leftTab === "analysis" && <AnalysisPanel />}
       {editor.leftTab === "effects" && <EffectsPanel />}
       {editor.leftTab === "captions" && <CaptionsPanel />}
       {editor.leftTab === "transitions" && <TransitionsPanel />}
@@ -641,6 +715,21 @@ function clipCssFilter(clip: TimelineClip): string | undefined {
     if (effect.kind === "blur") filters.push(`blur(${Math.abs(effect.value) * 10}px)`);
   }
   return filters.join(" ") || undefined;
+}
+
+function clipProgramStyle(clip: TimelineClip, timelineTick: number, project: EditorProject, frameWidth?: number, frameHeight?: number, zIndex?: number): CSSProperties {
+  const transform = transformAtTimelineTick(clip, timelineTick);
+  const elapsed = Math.max(0, timelineTick - clip.startTick);
+  const remaining = Math.max(0, clip.durationTicks - elapsed);
+  const transitionInOpacity = clip.transitionIn ? Math.min(1, elapsed / Math.max(1, clip.transitionIn.durationTicks)) : 1;
+  const transitionOutOpacity = clip.transitionOut ? Math.min(1, remaining / Math.max(1, clip.transitionOut.durationTicks)) : 1;
+  return {
+    transform: `translate(${transform.x * (frameWidth ?? project.settings.width) / project.settings.width}px, ${transform.y * (frameHeight ?? project.settings.height) / project.settings.height}px) scale(${transform.scale}) rotate(${transform.rotation}deg)`,
+    opacity: transform.opacity * Math.min(transitionInOpacity, transitionOutOpacity),
+    filter: clipCssFilter(clip),
+    clipPath: `inset(${transform.cropTop * 100}% ${transform.cropRight * 100}% ${transform.cropBottom * 100}% ${transform.cropLeft * 100}%)`,
+    zIndex,
+  };
 }
 
 function configureMediaElement(media: HTMLMediaElement, item: PlaybackItem, timelineTick: number) {
@@ -758,8 +847,51 @@ function AuxiliaryAudio({ item, asset, timelineTick, playing, onFailure }: { ite
   }} />;
 }
 
+function ProgramVideoLayer({ item, asset, timelineTick, playing, style, onFailure }: {
+  item: PlaybackItem;
+  asset: MediaAsset;
+  timelineTick: number;
+  playing: boolean;
+  style?: CSSProperties;
+  onFailure: (asset: MediaAsset) => void;
+}) {
+  const mediaRef = useRef<HTMLVideoElement>(null);
+  const source = resolveMediaSource(asset, asset.proxyPath ?? asset.path).source;
+  useEffect(() => {
+    const media = mediaRef.current;
+    if (!media || !source) return;
+    configureMediaElement(media, item, timelineTick);
+    media.muted = true;
+    if (playing) void media.play().catch(() => onFailure(asset));
+    else media.pause();
+  }, [asset, item, onFailure, playing, source, timelineTick]);
+  if (!source) return null;
+  return <video
+    ref={mediaRef}
+    src={source}
+    className="program-video-layer"
+    preload="auto"
+    playsInline
+    muted
+    style={style}
+    onLoadedMetadata={() => {
+      const media = mediaRef.current;
+      if (!media) return;
+      configureMediaElement(media, item, timelineTick);
+      media.muted = true;
+    }}
+    onError={() => onFailure(asset)}
+  />;
+}
+
 function Viewer() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const playheadTick = useEditorSelector((state) => state.playheadTick);
+  const isPlaying = useEditorSelector((state) => state.isPlaying);
+  const jobs = useEditorSelector((state) => state.jobs);
+  const analyses = useEditorSelector((state) => state.analyses);
+  const showAnalysisOverlay = useEditorSelector((state) => state.showAnalysisOverlay);
+  const editor = { project, playheadTick, isPlaying, jobs, analyses, showAnalysisOverlay, ...useEditorActions() };
   const videoRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const playheadRef = useRef(editor.playheadTick);
@@ -794,9 +926,13 @@ function Viewer() {
   });
   const previewTick = programPreviewTick(editor.playheadTick, sequenceTicks, frameTick);
   const activeVideo = activeVideoPlaybackItem(programItems, previewTick);
+  const activeVideoLayers = programItems.filter((item) => item.track.kind === "video" && !item.track.hidden && previewTick >= item.clip.startTick && previewTick < item.clip.startTick + item.clip.durationTicks)
+    .sort((left, right) => left.trackIndex - right.trackIndex);
+  const supportingVideoLayers = activeVideoLayers.filter((item) => item.clip.id !== activeVideo?.clip.id);
   const activeAudio = activeAudioPlaybackItems(programItems, previewTick).filter((item) => editor.project.assets.some((asset) => asset.id === item.clip.assetId && asset.hasAudio));
   const active = activeVideo ?? activeAudio[0];
   const activeClipId = active?.clip.id;
+  const activePlaybackRef = useRef(active);
   const previewItem = active;
   const previewClip = previewItem?.clip;
   const asset = resolvePlaybackAsset(editor.project.assets, previewClip?.assetId);
@@ -823,8 +959,9 @@ function Viewer() {
   useEffect(() => {
     playheadRef.current = editor.playheadTick;
     playingRef.current = editor.isPlaying;
+    activePlaybackRef.current = active;
     actionsRef.current = { setError: editor.setError, setPlaying: editor.setPlaying, setPlayhead: editor.setPlayhead, setStatus: editor.setStatus };
-  }, [editor.isPlaying, editor.playheadTick, editor.setError, editor.setPlaying, editor.setPlayhead, editor.setStatus]);
+  }, [active, editor.isPlaying, editor.playheadTick, editor.setError, editor.setPlaying, editor.setPlayhead, editor.setStatus]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -1035,12 +1172,6 @@ function Viewer() {
   }, [active, editor.isPlaying, previewTick, source]);
 
   useEffect(() => {
-    if (hasTimelineContent && !editor.isPlaying && editor.playheadTick >= sequenceTicks) {
-      scheduleAppSurfaceRefresh(120);
-    }
-  }, [editor.isPlaying, editor.playheadTick, hasTimelineContent, sequenceTicks]);
-
-  useEffect(() => {
     const media = videoRef.current;
     if (!media || !editor.isPlaying || !active) return;
     configureMediaElement(media, active, playheadRef.current);
@@ -1051,6 +1182,30 @@ function Viewer() {
     // Active clip/source changes are the only automatic continuation points.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.clip.id, editor.isPlaying, source]);
+
+  useEffect(() => {
+    const item = activePlaybackRef.current;
+    if (!editor.isPlaying || !item) return;
+    const clipEnd = item.clip.startTick + item.clip.durationTicks;
+    let frame = 0;
+    const synchronize = () => {
+      const media = videoRef.current;
+      if (!media || media.paused || media.seeking) {
+        frame = requestAnimationFrame(synchronize);
+        return;
+      }
+      const timelineTick = mediaSecondsToTimelineTick(item.clip, media.currentTime);
+      if (timelineTick >= clipEnd - Math.max(1, frameTick / 2)) {
+        actionsRef.current.setPlayhead(clipEnd);
+        if (clipEnd >= sequenceTicks) actionsRef.current.setPlaying(false);
+        return;
+      }
+      if (Math.abs(timelineTick - playheadRef.current) >= Math.max(1, frameTick / 2)) actionsRef.current.setPlayhead(timelineTick);
+      frame = requestAnimationFrame(synchronize);
+    };
+    frame = requestAnimationFrame(synchronize);
+    return () => cancelAnimationFrame(frame);
+  }, [activeClipId, editor.isPlaying, frameTick, sequenceTicks, source]);
 
   const advance = (from = active) => {
     if (!from) return;
@@ -1075,15 +1230,19 @@ function Viewer() {
     }
   };
 
-  const transform = previewClip?.transform;
-  const elapsed = previewClip ? Math.max(0, editor.playheadTick - previewClip.startTick) : 0;
-  const remaining = previewClip ? Math.max(0, previewClip.durationTicks - elapsed) : 0;
-  const transitionInOpacity = previewClip?.transitionIn ? Math.min(1, elapsed / Math.max(1, previewClip.transitionIn.durationTicks)) : 1;
-  const transitionOutOpacity = previewClip?.transitionOut ? Math.min(1, remaining / Math.max(1, previewClip.transitionOut.durationTicks)) : 1;
-  const transitionOpacity = Math.min(transitionInOpacity, transitionOutOpacity);
   const programAspect = editor.project.settings.width / editor.project.settings.height;
   const frameWidth = stageSize.width > 0 ? Math.max(1, Math.min(stageSize.width - 28, (stageSize.height - 24) * programAspect)) : undefined;
   const frameHeight = frameWidth ? frameWidth / programAspect : undefined;
+  const activeAnalysis = asset ? editor.analyses[asset.id] : undefined;
+  const sourceTick = previewClip ? previewClip.sourceInTick + Math.round(Math.max(0, previewTick - previewClip.startTick) * previewClip.speed) : 0;
+  const visualScene = activeAnalysis?.scenes.find((scene) => sourceTick >= scene.startTick && sourceTick < scene.endTick);
+  const mediaScale = asset?.width && asset.height && frameWidth && frameHeight ? Math.min(frameWidth / asset.width, frameHeight / asset.height) : 1;
+  const mediaRect = asset?.width && asset.height && frameWidth && frameHeight ? {
+    width: asset.width * mediaScale,
+    height: asset.height * mediaScale,
+    left: (frameWidth - asset.width * mediaScale) / 2,
+    top: (frameHeight - asset.height * mediaScale) / 2,
+  } : undefined;
   const captionPreviewStyle: CSSProperties = {
     color: captionStyle.textColor,
     backgroundColor: captionStyle.background ? captionStyle.backgroundColor : "transparent",
@@ -1095,12 +1254,7 @@ function Viewer() {
     bottom: captionStyle.position === "bottom" ? "9%" : "auto",
     transform: captionStyle.position === "center" ? "translateY(-50%)" : undefined,
   };
-  const programMediaStyle: CSSProperties | undefined = transform ? {
-    transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale}) rotate(${transform.rotation}deg)`,
-    opacity: transform.opacity * transitionOpacity,
-    filter: clipCssFilter(previewClip),
-    clipPath: `inset(${transform.cropTop * 100}% ${transform.cropRight * 100}% ${transform.cropBottom * 100}% ${transform.cropLeft * 100}%)`,
-  } : undefined;
+  const programMediaStyle = previewClip ? clipProgramStyle(previewClip, previewTick, editor.project, frameWidth, frameHeight, activeVideo?.trackIndex) : undefined;
   const seek = (tick: number) => {
     const bounded = Math.max(0, Math.min(totalTicks, tick));
     editor.setPlayhead(bounded);
@@ -1113,23 +1267,27 @@ function Viewer() {
     stopPlayback();
     seek(tick);
   };
-  const reportAuxiliaryFailure = (failedAsset: MediaAsset) => {
+  const reportAuxiliaryFailure = useCallback((failedAsset: MediaAsset) => {
     const message = playbackFailureMessage(failedAsset.name);
     setPlaybackError(message);
     actionsRef.current.setError(message);
     actionsRef.current.setPlaying(false);
-  };
+  }, []);
   const inTimelineGap = hasTimelineContent && !active;
   return (
     <section className="viewer" aria-label="Monitor de programa">
       <div className="viewer-head"><span>Programa</span><span className="viewer-source">{previewClip?.name ?? (inTimelineGap ? "Gap da timeline" : "Sem mídia")}</span><span>{editor.project.settings.width}×{editor.project.settings.height} · {editor.project.settings.fpsNum / editor.project.settings.fpsDen} fps</span></div>
       <div className="viewer-stage" ref={stageRef}>
         <div className="program-frame" style={{ width: frameWidth, height: frameHeight }}>
+          {supportingVideoLayers.map((item) => {
+            const layerAsset = editor.project.assets.find((candidate) => candidate.id === item.clip.assetId);
+            return layerAsset ? <ProgramVideoLayer key={item.clip.id} item={item} asset={layerAsset} timelineTick={previewTick} playing={editor.isPlaying} style={clipProgramStyle(item.clip, previewTick, editor.project, frameWidth, frameHeight, item.trackIndex)} onFailure={reportAuxiliaryFailure} /> : null;
+          })}
           {source ? (<>
             <video
             ref={videoRef}
             src={source}
-            className={activeVideo ? undefined : "audio-engine"}
+            className={activeVideo ? "program-video-layer primary" : "audio-engine"}
             preload="auto"
             playsInline
             onLoadedMetadata={() => {
@@ -1148,15 +1306,12 @@ function Viewer() {
               reportPlaybackFailure(undefined, event.currentTarget.error?.code);
             }}
             onEnded={(event) => { preserveFinalFrame(event.currentTarget); advance(); }}
-            onTimeUpdate={(event) => {
-              if (!editor.isPlaying || !active) return;
-              const timelineTick = mediaSecondsToTimelineTick(active.clip, event.currentTarget.currentTime);
-              if (timelineTick >= active.clip.startTick + active.clip.durationTicks) advance(active);
-              else editor.setPlayhead(timelineTick);
-            }}
             style={{ ...programMediaStyle, visibility: showFinalFrame ? "hidden" : undefined }}
             />
             {finalFrame && <img src={finalFrame.source} className={`video-snapshot ${showFinalFrame ? "visible" : ""}`} style={programMediaStyle} alt="" aria-hidden="true" />}
+            {editor.showAnalysisOverlay && visualScene && mediaRect && <div className="analysis-overlay" style={{ ...mediaRect, transform: programMediaStyle?.transform, clipPath: programMediaStyle?.clipPath }} aria-label={`${visualScene.observations.length} observações visuais`}>
+              {visualScene.observations.map((observation) => <span key={observation.id} data-kind={observation.kind} style={{ left: `${observation.rect.x * 100}%`, top: `${observation.rect.y * 100}%`, width: `${observation.rect.width * 100}%`, height: `${observation.rect.height * 100}%` }}><em>{observation.text ?? observation.label}</em></span>)}
+            </div>}
           </>) : <div className="viewer-empty"><Icon name="video" /><strong>{assetProxyJob ? "Gerando proxy compatível" : inTimelineGap ? "Gap da timeline" : "Nenhuma mídia no monitor"}</strong><span>{assetProxyJob ? "O vídeo será carregado automaticamente quando o proxy estiver pronto." : inTimelineGap ? "O programa permanece preto até o próximo clipe." : "Insira uma mídia na timeline para iniciar a edição."}</span></div>}
           {source && asset && !asset.width && <div className="viewer-audio"><Icon name="audio" /><strong>{asset.name}</strong><span>Pré-visualização de áudio</span></div>}
           {auxiliaryAudio.map((item) => {
@@ -1183,7 +1338,9 @@ function ValueControl({ label, value, min, max, step = 1, onChange }: { label: s
 }
 
 function InspectorPanel() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const selection = useEditorSelector((state) => state.selection);
+  const editor = { project, selection, ...useEditorActions() };
   const selected = selectedClipData(editor.project, editor.selection.clipIds);
   const asset = editor.project.assets.find((item) => item.id === editor.selection.assetId);
   const updateProjectSettings = (patch: Partial<typeof editor.project.settings>) => void editor.commit("Configurar sequência", [{ type: "setProjectSettings", settings: { ...editor.project.settings, ...patch } }]);
@@ -1209,19 +1366,25 @@ const chatStarters = [
 ];
 
 function ChatPanel() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const messages = useEditorSelector((state) => state.messages);
+  const agentSteps = useEditorSelector((state) => state.agentSteps);
+  const selection = useEditorSelector((state) => state.selection);
+  const proposal = useEditorSelector((state) => state.proposal);
+  const editor = { project, messages, agentSteps, selection, proposal, ...useEditorActions() };
   const [prompt, setPrompt] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
+  const [applyingProposal, setApplyingProposal] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const cancelledRef = useRef(false);
-  const busy = editor.agentSteps.some((step) => step.state === "running");
+  const busy = applyingProposal || editor.agentSteps.some((step) => step.state === "running");
   useEffect(() => {
     const messages = messagesRef.current;
     if (!messages) return;
     messages.scrollTo({ top: messages.scrollHeight, behavior: "smooth" });
-  }, [editor.messages, editor.agentSteps]);
+  }, [editor.messages, editor.agentSteps, editor.proposal]);
 
   const configureKey = async () => {
     if (!apiKey.trim() || !isTauriRuntime()) return;
@@ -1240,17 +1403,17 @@ function ChatPanel() {
     requestAnimationFrame(() => composerRef.current?.focus());
   };
 
-  const send = async () => {
-    const text = prompt.trim();
-    if (!text || busy) return;
+  const send = async (answer?: string) => {
+    const text = (answer ?? prompt).trim();
+    if (!text || busy || editor.proposal) return;
     cancelledRef.current = false;
     setPrompt("");
     editor.addMessage("user", text);
     const total = sequenceDuration(activeSequence(editor.project));
     const steps = [
-      { id: createId("step"), label: "Ler transcript e timeline", state: "running" as const, range: { startTick: 0, endTick: total } },
-      { id: createId("step"), label: "Decidir próximo passo", state: "queued" as const },
-      { id: createId("step"), label: "Aplicar transação", state: "queued" as const },
+      { id: createId("step"), label: "Ler contexto local", state: "running" as const, range: { startTick: 0, endTick: total } },
+      { id: createId("step"), label: "Planejar edição", state: "queued" as const },
+      { id: createId("step"), label: "Preparar revisão", state: "queued" as const },
     ];
     editor.setAgentSteps(steps);
     if (!isTauriRuntime()) {
@@ -1260,7 +1423,22 @@ function ChatPanel() {
     }
     try {
       editor.setAgentSteps(steps.map((step, index) => ({ ...step, state: index === 1 ? "running" as const : index < 1 ? "completed" as const : step.state })));
-      const plan = await nativeApi.planEdit(resolveRetryPrompt(text, editor.messages), editor.project, editor.messages, editor.selection);
+      let plan = await nativeApi.planEdit(resolveRetryPrompt(text, editor.messages), editor.project, editor.messages, editor.selection);
+      if (plan.analysisRequest) {
+        const request = plan.analysisRequest;
+        const asset = editor.project.assets.find((candidate) => candidate.id === request.assetId);
+        if (!asset) throw new Error("O Gemini solicitou análise de uma mídia que não existe no projeto.");
+        editor.setAgentSteps(steps.map((step, index) => ({
+          ...step,
+          label: index === 1 ? "Aprofundar análise visual" : step.label,
+          state: index === 1 ? "running" as const : index < 1 ? "completed" as const : step.state,
+        })));
+        editor.addMessage("assistant", `${plan.message} ${request.reason}`);
+        const analysis = await editor.startAnalysis(asset, request.prompts, true);
+        if (!analysis) throw new Error("A análise visual direcionada não pôde ser executada.");
+        plan = await nativeApi.planEdit(`${text}\n\nA análise visual direcionada solicitada foi concluída. Continue o planejamento sem solicitar uma segunda análise.`, editor.project, editor.messages, editor.selection);
+        if (plan.analysisRequest) throw new Error("O planejamento solicitou análises visuais repetidas sem produzir uma decisão editorial.");
+      }
       if (cancelledRef.current) {
         editor.setAgentSteps(steps.map((step) => ({ ...step, state: "cancelled" as const })));
         editor.addMessage("assistant", "Operação cancelada antes de alterar a timeline.");
@@ -1272,13 +1450,16 @@ function ChatPanel() {
           label: index === 2 ? "Pergunta enviada" : step.label,
           state: "completed" as const,
         })));
-        editor.addMessage("assistant", formatAgentQuestion(plan.question));
+        editor.addMessage("assistant", plan.message, plan.question);
         requestAnimationFrame(() => composerRef.current?.focus());
         return;
       }
-      editor.setAgentSteps(steps.map((step, index) => ({ ...step, state: index === 2 ? "running" as const : index < 2 ? "completed" as const : step.state })));
-      if (plan.operations.length) await editor.commit("Edição do agente", plan.operations, "agent");
-      editor.setAgentSteps(steps.map((step) => ({ ...step, state: "completed" as const })));
+      if (plan.proposal) {
+        editor.setProposal(plan.proposal);
+        editor.setAgentSteps(steps.map((step, index) => ({ ...step, label: index === 2 ? "Aguardando revisão" : step.label, state: "completed" as const })));
+      } else {
+        editor.setAgentSteps(steps.map((step) => ({ ...step, state: "completed" as const })));
+      }
       editor.addMessage("assistant", plan.message);
     } catch (error) {
       if (cancelledRef.current) return;
@@ -1287,11 +1468,18 @@ function ChatPanel() {
     }
   };
 
+  const applyProposal = async () => {
+    setApplyingProposal(true);
+    try { await editor.applyProposal(); }
+    catch (error) { editor.setError(errorMessage(error)); }
+    finally { setApplyingProposal(false); }
+  };
+
   return (
     <div className="chat-panel">
       <div className="chat-settings">
         <div className="chat-config">
-          <span>Gemini usa somente texto</span>
+          <span>Gemini usa metadados locais</span>
           <button className="text-link" onClick={() => setShowKey(!showKey)}>Chave da sessão</button>
         </div>
         {showKey && <div className="key-entry"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="GEMINI_API_KEY" /><button className="text-button" onClick={() => void configureKey()}>Aplicar</button></div>}
@@ -1301,11 +1489,19 @@ function ChatPanel() {
           <div className="empty-chat-intro"><span className="empty-chat-icon"><Icon name="chat" /></span><div><strong>Descreva a edição</strong><p>O agente usa a transcrição, a seleção e a timeline. Se faltar uma decisão importante, ele pergunta antes de editar.</p></div></div>
           <div className="chat-starters"><span>Experimente</span>{chatStarters.map((starter) => <button key={starter} type="button" className="chat-starter" onClick={() => fillStarter(starter)}>{starter}</button>)}</div>
         </div>}
-        {editor.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "Você" : message.role === "assistant" ? "Gemini" : "Sistema"}</span><p>{message.text}</p></article>)}
+        {editor.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "Você" : message.role === "assistant" ? "Gemini" : "Sistema"}</span><p>{message.text}</p>{message.question && <div className="agent-question">{message.question.context && <small>{message.question.context}</small>}{message.question.options.length > 0 && <div>{message.question.options.map((option) => <button key={option} type="button" onClick={() => void send(option)} disabled={busy || Boolean(editor.proposal)}>{option}</button>)}</div>}</div>}</article>)}
         {editor.agentSteps.length > 0 && <div className="agent-ledger">{editor.agentSteps.map((step) => <div key={step.id} data-state={step.state}><span className="step-indicator" /><span>{step.label}</span><small>{step.state}</small></div>)}</div>}
+        {editor.proposal && <section className="proposal-card" aria-label="Proposta de edição aguardando revisão">
+          <header><span>Proposta IA</span><small>Confiança {editor.proposal.confidence}</small></header>
+          <strong>{editor.proposal.summary}</strong>
+          <p>{editor.proposal.rationale}</p>
+          <div className="proposal-metrics"><span>{editor.proposal.operations.length} operações</span><span>{editor.proposal.evidence.length} evidências</span></div>
+          {editor.proposal.evidence.length > 0 && <div className="proposal-evidence">{editor.proposal.evidence.slice(0, 8).map((evidence) => <button key={evidence.id} type="button" onClick={() => editor.setPlayhead(evidence.startTick)}><span>{evidence.kind}</span><strong>{evidence.label}</strong><small>{formatTimecode(evidence.startTick)}–{formatTimecode(evidence.endTick)}</small></button>)}</div>}
+          <footer><button type="button" className="text-button" onClick={editor.rejectProposal} disabled={applyingProposal}>Descartar</button><button type="button" className="primary-button" onClick={() => void applyProposal()} disabled={applyingProposal}>{applyingProposal ? "Aplicando…" : "Aplicar proposta"}</button></footer>
+        </section>}
       </div>
       <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void send(); }}>
-        <textarea ref={composerRef} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Descreva o resultado desejado" rows={3} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
+        <textarea ref={composerRef} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={editor.proposal ? "Revise a proposta antes de continuar" : "Descreva o resultado desejado"} disabled={Boolean(editor.proposal)} rows={3} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
         <div><span>Enter envia · Shift+Enter quebra linha</span>{busy ? <button type="button" className="stop-button" onClick={() => { cancelledRef.current = true; editor.setAgentSteps(editor.agentSteps.map((step) => step.state === "running" || step.state === "queued" ? { ...step, state: "cancelled" } : step)); }}><Icon name="stop" /> Stop</button> : <button className="send-button" aria-label="Enviar"><Icon name="send" /></button>}</div>
       </form>
     </div>
@@ -1313,7 +1509,8 @@ function ChatPanel() {
 }
 
 function RightPanel() {
-  const editor = useEditor();
+  const rightTab = useEditorSelector((state) => state.rightTab);
+  const editor = { rightTab, ...useEditorActions() };
   return (
     <aside className="right-panel" aria-label="Inspector e agente">
       <nav className="right-tabs"><button className={editor.rightTab === "inspector" ? "active" : ""} onClick={() => editor.setRightTab("inspector")}><Icon name="inspector" /> Inspector</button><button className={editor.rightTab === "chat" ? "active" : ""} onClick={() => editor.setRightTab("chat")}><Icon name="chat" /> Chat</button></nav>
@@ -1323,21 +1520,25 @@ function RightPanel() {
 }
 
 function StatusBar() {
-  const editor = useEditor();
+  const project = useEditorSelector((state) => state.project);
+  const jobs = useEditorSelector((state) => state.jobs);
+  const status = useEditorSelector((state) => state.status);
+  const editor = { project, jobs, status };
   const [runtime, setRuntime] = useState<RuntimeStatus>();
   useEffect(() => {
     if (!isTauriRuntime()) return;
     void nativeApi.runtimeStatus(localStorage.getItem("whisperModelPath") ?? undefined).then(setRuntime).catch(() => undefined);
   }, []);
   const activeJobs = editor.jobs.filter((job) => job.state === "running");
-  return <footer className="statusbar"><div>{activeJobs.length ? activeJobs.map((job) => <span key={job.id} className="job-status"><i style={{ width: `${job.progress * 100}%` }} />{job.label}</span>) : editor.status}</div><div><span className={isTauriRuntime() ? "runtime-ok" : "runtime-missing"}>{isTauriRuntime() ? "Desktop" : "Preview web"}</span>{runtime && <><span className={runtime.ffmpeg.available && runtime.ffprobe.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.ffmpeg.detail} · ${runtime.ffprobe.detail}`}>FFmpeg</span><span className={runtime.youtube.available ? "runtime-ok" : "runtime-missing"} title={runtime.youtube.detail}>YouTube</span><span className={runtime.whisper.available && runtime.model.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.whisper.detail} · ${runtime.model.detail}`}>Whisper</span></>}<span>Rev {editor.project.revision}</span><span>{editor.project.assets.length} assets</span></div></footer>;
+  return <footer className="statusbar"><div>{activeJobs.length ? activeJobs.map((job) => <span key={job.id} className="job-status"><i style={{ width: `${job.progress * 100}%` }} />{job.label}</span>) : editor.status}</div><div><span className={isTauriRuntime() ? "runtime-ok" : "runtime-missing"}>{isTauriRuntime() ? "Desktop" : "Preview web"}</span>{runtime && <><span className={runtime.ffmpeg.available && runtime.ffprobe.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.ffmpeg.detail} · ${runtime.ffprobe.detail}`}>FFmpeg</span><span className={runtime.youtube.available ? "runtime-ok" : "runtime-missing"} title={runtime.youtube.detail}>YouTube</span><span className={runtime.whisper.available && runtime.model.available ? "runtime-ok" : "runtime-missing"} title={`${runtime.whisper.detail} · ${runtime.model.detail}`}>Whisper</span><span className={runtime.ocr.available ? "runtime-ok" : "runtime-missing"} title={runtime.ocr.detail}>OCR</span><span className={runtime.objects.available ? "runtime-ok" : "runtime-missing"} title={runtime.objects.detail}>Objetos</span></>}<span>Rev {editor.project.revision}</span><span>{editor.project.assets.length} assets</span></div></footer>;
 }
 
 export function Workspace() {
-  const editor = useEditor();
+  const error = useEditorSelector((state) => state.error);
+  const editor = useEditorActions();
   const workspaceRef = useRef<HTMLElement>(null);
   const [modelPath, setModelPath] = useState(() => localStorage.getItem("whisperModelPath") ?? "");
-  const { schedule: scheduleAutomaticTranscription, resumePending } = useAutomaticTranscription(editor, modelPath);
+  const { schedule: scheduleAutomaticTranscription, resumePending } = useAutomaticTranscription(modelPath);
   const updateModelPath = useCallback((path: string) => {
     if (path) localStorage.setItem("whisperModelPath", path);
     else localStorage.removeItem("whisperModelPath");
@@ -1407,7 +1608,7 @@ export function Workspace() {
         <div className="panel-resizer horizontal-resizer" role="separator" aria-label="Redimensionar timeline" aria-orientation="horizontal" tabIndex={0} onPointerDown={(event) => beginResize("horizontal", event)} onKeyDown={(event) => { if (event.key === "ArrowUp") resizeBy("horizontal", -10); if (event.key === "ArrowDown") resizeBy("horizontal", 10); }} />
       </main>
       <StatusBar />
-      {editor.error && <div className="error-toast" role="alert"><span>{editor.error}</span><button className="icon-button" onClick={() => editor.setError()} aria-label="Fechar erro"><Icon name="close" /></button></div>}
+      {error && <div className="error-toast" role="alert"><span>{error}</span><button className="icon-button" onClick={() => editor.setError()} aria-label="Fechar erro"><Icon name="close" /></button></div>}
     </div>
   );
 }

@@ -129,14 +129,65 @@ fn fade_filters(clip: &TimelineClip, timebase: i64) -> Vec<String> {
     filters
 }
 
+fn transform_value(transform: &crate::domain::Transform, field: &str) -> f64 {
+    match field {
+        "x" => transform.x,
+        "y" => transform.y,
+        "scale" => transform.scale,
+        "rotation" => transform.rotation,
+        "opacity" => transform.opacity,
+        "cropTop" => transform.crop_top,
+        "cropRight" => transform.crop_right,
+        "cropBottom" => transform.crop_bottom,
+        "cropLeft" => transform.crop_left,
+        _ => 0.0,
+    }
+}
+
+fn easing_expression(progress: &str, easing: &str) -> String {
+    match easing {
+        "easeIn" => format!("({progress})*({progress})"),
+        "easeOut" => format!("1-(1-({progress}))*(1-({progress}))"),
+        "easeInOut" => format!("if(lt(({progress}),0.5),2*({progress})*({progress}),1-pow(-2*({progress})+2,2)/2)"),
+        _ => format!("({progress})"),
+    }
+}
+
+fn animated_transform_expression(clip: &TimelineClip, field: &str, time_expression: &str, timebase: i64) -> String {
+    let base_value = transform_value(&clip.transform, field);
+    if clip.keyframes.is_empty() || clip.keyframes.iter().all(|keyframe| (transform_value(&keyframe.value, field) - base_value).abs() < 0.000_000_1) {
+        return format!("{base_value:.8}");
+    }
+    let mut points = vec![(0_i64, transform_value(&clip.transform, field), "linear")];
+    for keyframe in &clip.keyframes {
+        if keyframe.offset_tick == 0 { points[0] = (0, transform_value(&keyframe.value, field), keyframe.easing.as_str()); }
+        else { points.push((keyframe.offset_tick, transform_value(&keyframe.value, field), keyframe.easing.as_str())); }
+    }
+    let mut output = format!("{:.8}", points.last().map_or(points[0].1, |point| point.1));
+    for window in points.windows(2).rev() {
+        let (from_tick, from_value, _) = window[0];
+        let (to_tick, to_value, easing) = window[1];
+        let from = tick_seconds(from_tick, timebase);
+        let to = tick_seconds(to_tick, timebase);
+        let span = (to - from).max(0.000_001);
+        let progress = format!("(({time_expression})-{from:.8})/{span:.8}");
+        let eased = easing_expression(&progress, easing);
+        let interpolated = format!("{from_value:.8}+({to_value:.8}-{from_value:.8})*({eased})");
+        output = format!("if(lt(({time_expression}),{to:.8}),{interpolated},{output})");
+    }
+    output
+}
+
 fn overlay_x(clip: &TimelineClip, duration_tick: i64, timebase: i64) -> String {
-    let base = format!("(W-w)/2+{:.3}", clip.transform.x);
     let start = tick_seconds(clip.start_tick, timebase);
     let end = tick_seconds(clip.start_tick + duration_tick, timebase);
+    let local_time = format!("t-{start:.8}");
+    let x = animated_transform_expression(clip, "x", &local_time, timebase);
+    let base = format!("(W-w)/2+({x})");
     let transition_in = clip.transition_in.as_ref().filter(|transition| transition.kind == "slide");
     let transition_out = clip.transition_out.as_ref().filter(|transition| transition.kind == "slide");
     match (transition_in, transition_out) {
-        (None, None) => base,
+        (None, None) => format!("'{base}'"),
         (Some(input), None) => {
             let duration = tick_seconds(input.duration_ticks.min(duration_tick), timebase).max(0.001);
             format!("'{base}+if(between(t,{start:.6},{:.6}),({:.6}-t)/{duration:.6}*W,0)'", start + duration, start + duration)
@@ -151,6 +202,13 @@ fn overlay_x(clip: &TimelineClip, duration_tick: i64, timebase: i64) -> String {
             format!("'{base}+if(between(t,{start:.6},{:.6}),({:.6}-t)/{in_duration:.6}*W,if(between(t,{:.6},{end:.6}),(t-{:.6})/{out_duration:.6}*W,0))'", start + in_duration, start + in_duration, end - out_duration, end - out_duration)
         }
     }
+}
+
+fn overlay_y(clip: &TimelineClip, timebase: i64) -> String {
+    let start = tick_seconds(clip.start_tick, timebase);
+    let local_time = format!("t-{start:.8}");
+    let y = animated_transform_expression(clip, "y", &local_time, timebase);
+    format!("'(H-h)/2+({y})'")
 }
 
 fn build_render_plan(project: &EditorProject, subtitle_path: Option<&Path>) -> Result<RenderPlan, AppError> {
@@ -172,26 +230,34 @@ fn build_render_plan(project: &EditorProject, subtitle_path: Option<&Path>) -> R
         let source_duration = tick_seconds((clip.duration_ticks as f64 * clip.speed).round() as i64, project.settings.timebase);
         let timeline_start = tick_seconds(clip.start_tick, project.settings.timebase);
         if input.video {
-            let crop_width = (1.0 - clip.transform.crop_left - clip.transform.crop_right).clamp(0.02, 1.0);
-            let crop_height = (1.0 - clip.transform.crop_top - clip.transform.crop_bottom).clamp(0.02, 1.0);
+            let local_time = "t";
+            let crop_top = animated_transform_expression(clip, "cropTop", local_time, project.settings.timebase);
+            let crop_right = animated_transform_expression(clip, "cropRight", local_time, project.settings.timebase);
+            let crop_bottom = animated_transform_expression(clip, "cropBottom", local_time, project.settings.timebase);
+            let crop_left = animated_transform_expression(clip, "cropLeft", local_time, project.settings.timebase);
             let mut filters = vec![
                 format!("trim=start={source_start:.6}:duration={source_duration:.6}"),
-                "setpts=PTS-STARTPTS".into(),
-                format!("crop=iw*{crop_width:.6}:ih*{crop_height:.6}:iw*{:.6}:ih*{:.6}", clip.transform.crop_left.clamp(0.0, 0.98), clip.transform.crop_top.clamp(0.0, 0.98)),
+                format!("setpts=(PTS-STARTPTS)/{:.6}", clip.speed.clamp(0.05, 20.0)),
+                format!("crop=w='iw*max(0.02,1-({crop_left})-({crop_right}))':h='ih*max(0.02,1-({crop_top})-({crop_bottom}))':x='iw*({crop_left})':y='ih*({crop_top})'"),
             ];
             filters.extend(effect_filters(clip));
-            let scale = clip.transform.scale.clamp(0.01, 10.0);
-            filters.push(format!("scale=w={}*{scale:.6}:h={}*{scale:.6}:force_original_aspect_ratio=decrease", project.settings.width, project.settings.height));
-            if clip.transform.rotation.abs() > 0.001 {
-                let radians = clip.transform.rotation.to_radians();
-                filters.push(format!("rotate={radians:.8}:ow=rotw({radians:.8}):oh=roth({radians:.8}):c=none"));
+            let scale = animated_transform_expression(clip, "scale", local_time, project.settings.timebase);
+            filters.push(format!("scale=w='{}*({scale})':h='{}*({scale})':force_original_aspect_ratio=decrease:eval=frame", project.settings.width, project.settings.height));
+            if clip.transform.rotation.abs() > 0.001 || clip.keyframes.iter().any(|keyframe| keyframe.value.rotation.abs() > 0.001) {
+                let rotation = animated_transform_expression(clip, "rotation", local_time, project.settings.timebase);
+                filters.push(format!("rotate=angle='({rotation})*PI/180':ow=rotw('({rotation})*PI/180'):oh=roth('({rotation})*PI/180'):c=none"));
             }
             filters.push("format=rgba".into());
-            filters.push(format!("colorchannelmixer=aa={:.6}", clip.transform.opacity.clamp(0.0, 1.0)));
+            if clip.keyframes.iter().any(|keyframe| (keyframe.value.opacity - clip.transform.opacity).abs() > 0.000_000_1) {
+                let opacity = animated_transform_expression(clip, "opacity", "T", project.settings.timebase);
+                filters.push(format!("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({opacity})'"));
+            } else {
+                filters.push(format!("colorchannelmixer=aa={:.8}", clip.transform.opacity.clamp(0.0, 1.0)));
+            }
             filters.extend(fade_filters(clip, project.settings.timebase));
-            filters.push(format!("setpts=PTS/{:.6}+{timeline_start:.6}/TB", clip.speed.clamp(0.05, 20.0)));
+            filters.push(format!("setpts=PTS+{timeline_start:.6}/TB"));
             graph.push(format!("[{index}:v]{}[v{index}]", filters.join(",")));
-            video_labels.push((index, overlay_x(clip, clip.duration_ticks, project.settings.timebase), clip.transform.y));
+            video_labels.push((index, overlay_x(clip, clip.duration_ticks, project.settings.timebase), overlay_y(clip, project.settings.timebase)));
         }
         if input.audio {
             let mut filters = vec![
@@ -216,7 +282,7 @@ fn build_render_plan(project: &EditorProject, subtitle_path: Option<&Path>) -> R
     let mut video_output = "base".to_string();
     for (overlay_index, (input_index, x, y)) in video_labels.iter().enumerate() {
         let output = format!("overlay{overlay_index}");
-        graph.push(format!("[{video_output}][v{input_index}]overlay=x={x}:y=(H-h)/2+{y:.3}:eof_action=pass:repeatlast=0:shortest=0[{output}]"));
+        graph.push(format!("[{video_output}][v{input_index}]overlay=x={x}:y={y}:eval=frame:eof_action=pass:repeatlast=0:shortest=0[{output}]"));
         video_output = output;
     }
     if let Some(path) = subtitle_path {
@@ -323,12 +389,12 @@ pub async fn render_start(output_path: String, window: tauri::Window, state: tau
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{EffectInstance, MediaAsset, TimelineClip, Transform};
+    use crate::domain::{EffectInstance, MediaAsset, TimelineClip, Transform, TransformKeyframe};
 
     fn project_with_clip(path: &Path) -> EditorProject {
         let mut project = EditorProject::empty("Test");
         project.assets.push(MediaAsset { id: "asset".into(), name: "clip.mp4".into(), path: Some(path.to_string_lossy().into_owned()), object_url: None, duration_ticks: 2_400_000, width: Some(1920), height: Some(1080), fps: Some(30.0), codec: Some("h264".into()), has_audio: true, fingerprint: None, proxy_path: None, waveform: None, offline: false });
-        project.active_sequence_mut().unwrap().tracks[0].clips.push(TimelineClip { id: "clip".into(), asset_id: "asset".into(), name: "clip.mp4".into(), start_tick: 240_000, source_in_tick: 240_000, duration_ticks: 480_000, speed: 2.0, volume: 0.5, transform: Transform::default(), effects: vec![], transition_in: None, transition_out: None });
+        project.active_sequence_mut().unwrap().tracks[0].clips.push(TimelineClip { id: "clip".into(), asset_id: "asset".into(), name: "clip.mp4".into(), start_tick: 240_000, source_in_tick: 240_000, duration_ticks: 480_000, speed: 2.0, volume: 0.5, transform: Transform::default(), keyframes: vec![], effects: vec![], transition_in: None, transition_out: None });
         project
     }
 
@@ -337,7 +403,8 @@ mod tests {
         let media_file = tempfile::Builder::new().suffix(".mp4").tempfile().unwrap();
         let plan = build_render_plan(&project_with_clip(media_file.path()), None).unwrap();
         assert!(plan.filter_complex.contains("trim=start=1.000000:duration=4.000000"));
-        assert!(plan.filter_complex.contains("setpts=PTS/2.000000+1.000000/TB"));
+        assert!(plan.filter_complex.contains("setpts=(PTS-STARTPTS)/2.000000"));
+        assert!(plan.filter_complex.contains("setpts=PTS+1.000000/TB"));
         assert!(plan.filter_complex.contains("atempo=2.000000"));
         assert!(plan.filter_complex.contains("amix=inputs=1"));
         assert!(plan.filter_complex.contains("overlay="));
@@ -388,6 +455,14 @@ mod tests {
         clip.duration_ticks = 240_000;
         clip.speed = 1.0;
         clip.effects.push(EffectInstance { id: "effect".into(), kind: "contrast".into(), enabled: true, value: 0.1 });
+        let mut focused = clip.transform.clone();
+        focused.x = 24.0;
+        focused.y = -12.0;
+        focused.scale = 1.5;
+        focused.opacity = 0.8;
+        focused.rotation = 4.0;
+        focused.crop_left = 0.05;
+        clip.keyframes.push(TransformKeyframe { id: "focus".into(), offset_tick: 120_000, easing: "easeInOut".into(), value: focused });
         let plan = build_render_plan(&project, None).unwrap();
         let mut render = Command::new("ffmpeg");
         render.args(["-hide_banner", "-v", "error", "-y"]);

@@ -7,7 +7,7 @@
     "dev": "vite",
     "tauri": "tauri",
     "build": "tsc -b && vite build",
-    "lint": "eslint .",
+    "lint": "eslint src",
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
     "test:watch": "vitest",

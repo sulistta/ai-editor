@@ -13,6 +13,7 @@ function clip(id: string, startTick = 0, durationTicks = 240_000): TimelineClip 
     speed: 2,
     volume: 0.75,
     transform: { x: 0, y: 0, scale: 1, rotation: 0, opacity: 1, cropTop: 0, cropRight: 0, cropBottom: 0, cropLeft: 0 },
+    keyframes: [],
     effects: [],
   };
 }

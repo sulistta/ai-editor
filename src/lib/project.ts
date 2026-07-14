@@ -9,7 +9,8 @@ import type {
   TimelineTrack,
   Transcript,
 } from "../types";
-import { TICKS_PER_SECOND } from "../types";
+import { PROJECT_SCHEMA_VERSION, TICKS_PER_SECOND } from "../types";
+import { normalizeKeyframes, transformAtOffset } from "./transform";
 
 export const EMPTY_TRANSFORM = {
   x: 0,
@@ -48,7 +49,7 @@ export function createEmptyProject(name = "Projeto sem título"): EditorProject 
     { id: createId("track-audio"), name: "A1", kind: "audio", locked: false, muted: false, hidden: false, clips: [] },
   ];
   return {
-    schemaVersion: 1,
+    schemaVersion: PROJECT_SCHEMA_VERSION,
     projectId: createId("project"),
     name,
     revision: 0,
@@ -89,6 +90,7 @@ export function makeClip(asset: MediaAsset, startTick: number): TimelineClip {
     speed: 1,
     volume: 1,
     transform: { ...EMPTY_TRANSFORM },
+    keyframes: [],
     effects: [],
   };
 }
@@ -116,6 +118,21 @@ export function captionsFromTranscript(project: EditorProject, transcript: Trans
     }
   }
   return captions.sort((a, b) => a.startTick - b.startTick);
+}
+
+function normalizeClipTiming(clip: TimelineClip): void {
+  clip.keyframes = normalizeKeyframes(clip.keyframes, clip.durationTicks);
+  if (clip.transitionIn) clip.transitionIn.durationTicks = Math.max(1, Math.min(clip.durationTicks, clip.transitionIn.durationTicks));
+  if (clip.transitionOut) clip.transitionOut.durationTicks = Math.max(1, Math.min(clip.durationTicks, clip.transitionOut.durationTicks));
+}
+
+function truncateClipAnimation(clip: TimelineClip, durationTicks: number, boundaryId: string): void {
+  if (!clip.keyframes.some((keyframe) => keyframe.offsetTick > durationTicks)) return;
+  const boundaryTransform = transformAtOffset(clip.transform, clip.keyframes, durationTicks);
+  clip.keyframes = clip.keyframes.filter((keyframe) => keyframe.offsetTick <= durationTicks);
+  if (!clip.keyframes.some((keyframe) => keyframe.offsetTick === durationTicks)) {
+    clip.keyframes.push({ id: boundaryId, offsetTick: durationTicks, easing: "linear", value: boundaryTransform });
+  }
 }
 
 function applyCommand(project: EditorProject, command: EditCommand): void {
@@ -174,20 +191,43 @@ function applyCommand(project: EditorProject, command: EditCommand): void {
       track.clips.sort((a, b) => a.startTick - b.startTick);
       break;
     case "trimClip":
-      clip.sourceInTick = Math.max(0, command.sourceInTick);
-      clip.durationTicks = Math.max(1, command.durationTicks);
+      {
+        const nextSourceIn = Math.max(0, command.sourceInTick);
+        const shiftedTicks = Math.round((nextSourceIn - clip.sourceInTick) / clip.speed);
+        if (shiftedTicks > 0) {
+          clip.transform = transformAtOffset(clip.transform, clip.keyframes, shiftedTicks);
+          clip.keyframes = clip.keyframes.filter((keyframe) => keyframe.offsetTick > shiftedTicks).map((keyframe) => ({ ...keyframe, offsetTick: keyframe.offsetTick - shiftedTicks }));
+        } else if (shiftedTicks < 0) {
+          clip.keyframes = clip.keyframes.map((keyframe) => ({ ...keyframe, offsetTick: keyframe.offsetTick - shiftedTicks }));
+        }
+        clip.sourceInTick = nextSourceIn;
+      }
+      {
+        const nextDuration = Math.max(1, command.durationTicks);
+        truncateClipAnimation(clip, nextDuration, `${clip.id}-trim-boundary`);
+        clip.durationTicks = nextDuration;
+      }
+      normalizeClipTiming(clip);
       break;
     case "splitClip": {
       const leftDuration = command.atTick - clip.startTick;
       if (leftDuration <= 0 || leftDuration >= clip.durationTicks) break;
+      const splitTransform = transformAtOffset(clip.transform, clip.keyframes, leftDuration);
       const right: TimelineClip = {
         ...structuredClone(clip),
         id: command.rightClipId,
         startTick: command.atTick,
         sourceInTick: clip.sourceInTick + Math.round(leftDuration * clip.speed),
         durationTicks: clip.durationTicks - leftDuration,
+        transform: splitTransform,
+        keyframes: clip.keyframes.filter((keyframe) => keyframe.offsetTick > leftDuration).map((keyframe) => ({ ...keyframe, offsetTick: keyframe.offsetTick - leftDuration })),
+        transitionIn: undefined,
       };
+      truncateClipAnimation(clip, leftDuration, `${command.rightClipId}-split-boundary`);
+      clip.transitionOut = undefined;
       clip.durationTicks = leftDuration;
+      normalizeClipTiming(clip);
+      normalizeClipTiming(right);
       track.clips.splice(clipIndex + 1, 0, right);
       break;
     }
@@ -202,7 +242,21 @@ function applyCommand(project: EditorProject, command: EditCommand): void {
       break;
     }
     case "updateClip":
-      Object.assign(clip, command.patch);
+      {
+        const patch = structuredClone(command.patch);
+        if (typeof patch.durationTicks === "number" && patch.keyframes === undefined) {
+          truncateClipAnimation(clip, Math.max(1, patch.durationTicks), `${clip.id}-duration-boundary`);
+        }
+        if (typeof patch.speed === "number" && typeof patch.durationTicks !== "number") {
+          const nextSpeed = Math.min(20, Math.max(0.05, patch.speed));
+          const nextDuration = Math.max(1, Math.round(clip.durationTicks * clip.speed / nextSpeed));
+          clip.keyframes = clip.keyframes.map((keyframe) => ({ ...keyframe, offsetTick: Math.round(keyframe.offsetTick * nextDuration / clip.durationTicks) }));
+          patch.speed = nextSpeed;
+          patch.durationTicks = nextDuration;
+        }
+        Object.assign(clip, patch);
+        normalizeClipTiming(clip);
+      }
       break;
   }
 }

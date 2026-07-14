@@ -1,17 +1,16 @@
 import {
   createContext,
-  type PropsWithChildren,
-  useCallback,
   useContext,
-  useEffect,
-  useMemo,
-  useReducer,
-  useRef,
+  useSyncExternalStore,
 } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentStep,
+  AnalysisProgressEvent,
+  AssetAnalysis,
   ChatMessage,
   EditCommand,
+  EditProposal,
   EditorJob,
   EditorProject,
   MediaAsset,
@@ -21,109 +20,27 @@ import type {
 import { activeSequence, applyTransaction, createEmptyProject, createId, makeClip, sequenceDuration } from "../lib/project";
 import { errorMessage, isTauriRuntime, nativeApi } from "../lib/tauri";
 
-interface EditorState {
+export interface EditorState {
   project: EditorProject;
-  past: EditorProject[];
-  future: EditorProject[];
   selection: Selection;
   playheadTick: number;
   isPlaying: boolean;
   zoom: number;
-  leftTab: "media" | "effects" | "captions" | "transitions";
+  leftTab: "media" | "analysis" | "effects" | "captions" | "transitions";
   rightTab: "inspector" | "chat";
   messages: ChatMessage[];
   agentSteps: AgentStep[];
   jobs: EditorJob[];
+  analyses: Record<string, AssetAnalysis>;
+  proposal?: EditProposal;
+  showAnalysisOverlay: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
   error?: string;
   status: string;
 }
 
-type Action =
-  | { type: "replaceProject"; project: EditorProject; remember?: boolean }
-  | { type: "loadProject"; project: EditorProject }
-  | { type: "undo" }
-  | { type: "redo" }
-  | { type: "undoNative"; project: EditorProject }
-  | { type: "redoNative"; project: EditorProject }
-  | { type: "select"; selection: Selection }
-  | { type: "playhead"; tick: number }
-  | { type: "playing"; value: boolean }
-  | { type: "zoom"; value: number }
-  | { type: "leftTab"; value: EditorState["leftTab"] }
-  | { type: "rightTab"; value: EditorState["rightTab"] }
-  | { type: "message"; message: ChatMessage }
-  | { type: "agentSteps"; steps: AgentStep[] }
-  | { type: "job"; job: EditorJob }
-  | { type: "error"; message?: string }
-  | { type: "status"; value: string };
-
-const initialState: EditorState = {
-  project: createEmptyProject(),
-  past: [],
-  future: [],
-  selection: { clipIds: [] },
-  playheadTick: 0,
-  isPlaying: false,
-  zoom: 1,
-  leftTab: "media",
-  rightTab: "chat",
-  messages: [],
-  agentSteps: [],
-  jobs: [],
-  status: "Pronto",
-};
-
-function reducer(state: EditorState, action: Action): EditorState {
-  switch (action.type) {
-    case "replaceProject":
-      return {
-        ...state,
-        project: action.project,
-        past: action.remember === false ? state.past : [...state.past.slice(-49), state.project],
-        future: action.remember === false ? state.future : [],
-      };
-    case "loadProject":
-      return { ...state, project: action.project, past: [], future: [], selection: { clipIds: [] }, playheadTick: 0, isPlaying: false };
-    case "undo": {
-      const previous = state.past.at(-1);
-      if (!previous) return state;
-      return { ...state, project: previous, past: state.past.slice(0, -1), future: [state.project, ...state.future] };
-    }
-    case "redo": {
-      const next = state.future[0];
-      if (!next) return state;
-      return { ...state, project: next, past: [...state.past, state.project], future: state.future.slice(1) };
-    }
-    case "undoNative":
-      return { ...state, project: action.project, past: state.past.slice(0, -1), future: [state.project, ...state.future] };
-    case "redoNative":
-      return { ...state, project: action.project, past: [...state.past, state.project], future: state.future.slice(1) };
-    case "select":
-      return { ...state, selection: action.selection };
-    case "playhead":
-      return { ...state, playheadTick: Math.max(0, action.tick) };
-    case "playing":
-      return { ...state, isPlaying: action.value };
-    case "zoom":
-      return { ...state, zoom: Math.min(8, Math.max(0.25, action.value)) };
-    case "leftTab":
-      return { ...state, leftTab: action.value };
-    case "rightTab":
-      return { ...state, rightTab: action.value };
-    case "message":
-      return { ...state, messages: [...state.messages, action.message] };
-    case "agentSteps":
-      return { ...state, agentSteps: action.steps };
-    case "job":
-      return { ...state, jobs: [...state.jobs.filter((job) => job.id !== action.job.id), action.job] };
-    case "error":
-      return { ...state, error: action.message };
-    case "status":
-      return { ...state, status: action.value };
-  }
-}
-
-interface EditorContextValue extends EditorState {
+export interface EditorActions {
   commit: (label: string, commands: EditCommand[], source?: "manual" | "agent") => Promise<EditorProject>;
   importAsset: (asset: MediaAsset) => Promise<void>;
   insertAsset: (assetId: string) => Promise<void>;
@@ -141,192 +58,376 @@ interface EditorContextValue extends EditorState {
   setZoom: (value: number) => void;
   setLeftTab: (value: EditorState["leftTab"]) => void;
   setRightTab: (value: EditorState["rightTab"]) => void;
-  addMessage: (role: ChatMessage["role"], text: string) => void;
+  addMessage: (role: ChatMessage["role"], text: string, question?: ChatMessage["question"]) => void;
   setAgentSteps: (steps: AgentStep[]) => void;
   setJob: (job: EditorJob) => void;
+  setAnalysis: (analysis: AssetAnalysis) => void;
+  startAnalysis: (asset: MediaAsset, prompts?: string[], force?: boolean) => Promise<AssetAnalysis | undefined>;
+  cancelAnalysis: (assetId: string) => Promise<void>;
+  setProposal: (proposal?: EditProposal) => void;
+  applyProposal: () => Promise<void>;
+  rejectProposal: () => void;
+  setShowAnalysisOverlay: (value: boolean) => void;
   setError: (message?: string) => void;
   setStatus: (value: string) => void;
 }
 
-const EditorContext = createContext<EditorContextValue | null>(null);
+const initialState = (): EditorState => ({
+  project: createEmptyProject(),
+  selection: { clipIds: [] },
+  playheadTick: 0,
+  isPlaying: false,
+  zoom: 1,
+  leftTab: "media",
+  rightTab: "chat",
+  messages: [],
+  agentSteps: [],
+  jobs: [],
+  analyses: {},
+  showAnalysisOverlay: true,
+  canUndo: false,
+  canRedo: false,
+  status: "Pronto",
+});
 
-export function EditorProvider({ children }: PropsWithChildren) {
-  const [state, dispatch] = useReducer(reducer, initialState);
-  const projectRef = useRef(state.project);
-  const commitQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+export class EditorStore {
+  private state = initialState();
+  private readonly listeners = new Set<() => void>();
+  private readonly webPast: EditorProject[] = [];
+  private readonly webFuture: EditorProject[] = [];
+  private commitQueue: Promise<unknown> = Promise.resolve();
+  private autosaveTimer?: number;
+  private unlistenAnalysis?: UnlistenFn;
+  private disposed = false;
+  private lifecycleVersion = 0;
 
-  useEffect(() => {
+  readonly actions: EditorActions = {
+    commit: (label, commands, source) => this.commit(label, commands, source),
+    importAsset: (asset) => this.importAsset(asset),
+    insertAsset: (assetId) => this.insertAsset(assetId),
+    splitSelected: () => this.splitSelected(),
+    deleteSelected: (ripple) => this.deleteSelected(ripple),
+    duplicateSelected: () => this.duplicateSelected(),
+    updateSelectedClip: (patch) => this.updateSelectedClip(patch),
+    setTranscript: (transcript) => this.commit("Salvar transcrição local", [{ type: "setTranscript", transcript }]).then(() => undefined),
+    loadProject: (project) => this.loadProject(project),
+    undo: () => this.undo(),
+    redo: () => this.redo(),
+    select: (selection) => this.update({ selection }),
+    setPlayhead: (tick) => this.update({ playheadTick: Math.max(0, tick) }),
+    setPlaying: (isPlaying) => this.update({ isPlaying }),
+    setZoom: (zoom) => this.update({ zoom: Math.min(8, Math.max(0.25, zoom)) }),
+    setLeftTab: (leftTab) => this.update({ leftTab }),
+    setRightTab: (rightTab) => this.update({ rightTab }),
+    addMessage: (role, text, question) => this.update({ messages: [...this.state.messages, { id: createId("message"), role, text, question, createdAt: Date.now() }] }),
+    setAgentSteps: (agentSteps) => this.update({ agentSteps }),
+    setJob: (job) => this.setJob(job),
+    setAnalysis: (analysis) => this.setAnalysis(analysis),
+    startAnalysis: (asset, prompts, force) => this.startAnalysis(asset, prompts, force),
+    cancelAnalysis: (assetId) => this.cancelAnalysis(assetId),
+    setProposal: (proposal) => this.update({ proposal }),
+    applyProposal: () => this.applyProposal(),
+    rejectProposal: () => this.rejectProposal(),
+    setShowAnalysisOverlay: (showAnalysisOverlay) => this.update({ showAnalysisOverlay }),
+    setError: (error) => this.update({ error }),
+    setStatus: (status) => this.update({ status }),
+  };
+
+  getSnapshot = (): EditorState => this.state;
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  async initialize(): Promise<void> {
+    const lifecycleVersion = ++this.lifecycleVersion;
+    this.disposed = false;
     if (!isTauriRuntime()) return;
-    void nativeApi.snapshot().then((project) => {
-      projectRef.current = project;
-      dispatch({ type: "loadProject", project });
-    }).catch(() => undefined);
-  }, []);
-
-  useEffect(() => {
-    if (!isTauriRuntime() || state.project.revision === 0) return;
-    const timeout = window.setTimeout(() => {
-      void nativeApi.autosave().catch((error) => dispatch({ type: "error", message: `Autosave: ${errorMessage(error)}` }));
-    }, 1_200);
-    return () => window.clearTimeout(timeout);
-  }, [state.project.projectId, state.project.revision]);
-
-  const commit = useCallback((label: string, commands: EditCommand[], source: "manual" | "agent" = "manual"): Promise<EditorProject> => {
-    dispatch({ type: "status", value: label });
-    const run = async () => {
-      const current = projectRef.current;
-      const transaction = { id: createId("transaction"), baseRevision: current.revision, source, label, commands } as const;
-      if (!isTauriRuntime()) {
-        const project = applyTransaction(current, transaction);
-        projectRef.current = project;
-        dispatch({ type: "replaceProject", project });
-        return project;
+    try {
+      const unlistenAnalysis = await listen<AnalysisProgressEvent>("analysis-progress", ({ payload }) => {
+        if (this.disposed || lifecycleVersion !== this.lifecycleVersion) return;
+        this.setJob(payload.job);
+        if (payload.analysis) this.setAnalysis(payload.analysis);
+      });
+      if (this.disposed || lifecycleVersion !== this.lifecycleVersion) {
+        unlistenAnalysis();
+        return;
       }
+      this.unlistenAnalysis?.();
+      this.unlistenAnalysis = unlistenAnalysis;
+      const [project, history] = await Promise.all([nativeApi.snapshot(), nativeApi.historyStatus()]);
+      if (this.disposed || lifecycleVersion !== this.lifecycleVersion) return;
+      this.replaceLoadedProject(project);
+      this.update(history);
+      await this.hydrateAnalyses(project, lifecycleVersion);
+    } catch (error) {
+      if (!this.disposed && lifecycleVersion === this.lifecycleVersion) this.update({ error: errorMessage(error) });
+    }
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.lifecycleVersion += 1;
+    this.unlistenAnalysis?.();
+    this.unlistenAnalysis = undefined;
+    if (this.autosaveTimer !== undefined) window.clearTimeout(this.autosaveTimer);
+    for (const asset of this.state.project.assets) if (asset.objectUrl) URL.revokeObjectURL(asset.objectUrl);
+    this.listeners.clear();
+  }
+
+  private update(patch: Partial<EditorState>): void {
+    if (this.disposed) return;
+    this.state = { ...this.state, ...patch };
+    for (const listener of this.listeners) listener();
+  }
+
+  private replaceLoadedProject(project: EditorProject): void {
+    this.webPast.length = 0;
+    this.webFuture.length = 0;
+    this.update({
+      project,
+      selection: { clipIds: [] },
+      playheadTick: 0,
+      isPlaying: false,
+      proposal: undefined,
+      canUndo: false,
+      canRedo: false,
+    });
+  }
+
+  private scheduleAutosave(project: EditorProject): void {
+    if (!isTauriRuntime() || project.revision === 0) return;
+    if (this.autosaveTimer !== undefined) window.clearTimeout(this.autosaveTimer);
+    this.autosaveTimer = window.setTimeout(() => {
+      void nativeApi.autosave().catch((error) => this.update({ error: `Autosave: ${errorMessage(error)}` }));
+    }, 1_200);
+  }
+
+  private async commit(label: string, commands: EditCommand[], source: "manual" | "agent" = "manual"): Promise<EditorProject> {
+    if (commands.length === 0) return this.state.project;
+    this.update({ status: label });
+    const run = async () => {
+      const current = this.state.project;
+      const transaction = { id: createId("transaction"), baseRevision: current.revision, source, label, commands } as const;
       try {
-        const project = await nativeApi.apply(transaction);
-        projectRef.current = project;
-        dispatch({ type: "replaceProject", project });
+        let project: EditorProject;
+        if (isTauriRuntime()) {
+          project = await nativeApi.apply(transaction);
+        } else {
+          this.webPast.push(current);
+          if (this.webPast.length > 50) this.webPast.shift();
+          this.webFuture.length = 0;
+          project = applyTransaction(current, transaction);
+        }
+        this.update({ project, canUndo: true, canRedo: false });
+        this.scheduleAutosave(project);
         return project;
       } catch (error) {
-        dispatch({ type: "error", message: errorMessage(error) });
-        return projectRef.current;
+        const message = errorMessage(error);
+        this.update({ error: message, status: `Falha: ${label}` });
+        throw error;
       }
     };
-    const pending = commitQueueRef.current.then(run, run);
-    commitQueueRef.current = pending.then(() => undefined, () => undefined);
+    const pending = this.commitQueue.then(run, run);
+    this.commitQueue = pending.then(() => undefined, () => undefined);
     return pending;
-  }, []);
+  }
 
-  const importAsset = useCallback(async (asset: MediaAsset) => {
-    await commit(`Importar ${asset.name}`, [{ type: "addAsset", asset }]);
-    dispatch({ type: "select", selection: { clipIds: [], assetId: asset.id } });
-  }, [commit]);
+  private async importAsset(asset: MediaAsset): Promise<void> {
+    await this.commit(`Importar ${asset.name}`, [{ type: "addAsset", asset }]);
+    this.update({ selection: { clipIds: [], assetId: asset.id } });
+    if (asset.path && asset.fingerprint && asset.width && asset.height) void this.startAnalysis(asset).catch(() => undefined);
+  }
 
-  const insertAsset = useCallback(async (assetId: string) => {
-    const asset = state.project.assets.find((item) => item.id === assetId);
+  private async insertAsset(assetId: string): Promise<void> {
+    const asset = this.state.project.assets.find((item) => item.id === assetId);
     if (!asset) return;
-    const sequence = activeSequence(state.project);
+    const sequence = activeSequence(this.state.project);
     const mediaKind = asset.width && asset.height ? "video" : "audio";
     const track = sequence.tracks.find((item) => item.kind === mediaKind && !item.locked);
-    if (!track) return;
+    if (!track) throw new Error(`Nenhuma faixa ${mediaKind} editável está disponível`);
     const clip = makeClip(asset, sequenceDuration(sequence));
-    await commit(`Inserir ${asset.name}`, [{ type: "insertClip", trackId: track.id, clip }]);
-    dispatch({ type: "select", selection: { clipIds: [clip.id], trackId: track.id, assetId } });
-  }, [commit, state.project]);
+    await this.commit(`Inserir ${asset.name}`, [{ type: "insertClip", trackId: track.id, clip }]);
+    this.update({ selection: { clipIds: [clip.id], trackId: track.id, assetId } });
+  }
 
-  const splitSelected = useCallback(async () => {
-    const clipId = state.selection.clipIds[0];
-    const trackId = state.selection.trackId;
-    if (!clipId || !trackId) return;
-    await commit("Dividir clipe", [{ type: "splitClip", trackId, clipId, atTick: state.playheadTick, rightClipId: createId("clip") }]);
-  }, [commit, state.playheadTick, state.selection]);
+  private selectedTarget(): { trackId: string; clipIds: string[] } | undefined {
+    const { trackId, clipIds } = this.state.selection;
+    return trackId && clipIds.length ? { trackId, clipIds } : undefined;
+  }
 
-  const deleteSelected = useCallback(async (ripple = false) => {
-    const trackId = state.selection.trackId;
-    if (!trackId || state.selection.clipIds.length === 0) return;
-    await commit(
+  private async splitSelected(): Promise<void> {
+    const target = this.selectedTarget();
+    if (!target?.clipIds[0]) return;
+    await this.commit("Dividir clipe", [{ type: "splitClip", trackId: target.trackId, clipId: target.clipIds[0], atTick: this.state.playheadTick, rightClipId: createId("clip") }]);
+  }
+
+  private async deleteSelected(ripple = false): Promise<void> {
+    const target = this.selectedTarget();
+    if (!target) return;
+    await this.commit(
       ripple ? "Excluir e fechar espaço" : "Excluir clipe",
-      state.selection.clipIds.map((clipId) => ({ type: "deleteClip" as const, trackId, clipId, ripple })),
+      target.clipIds.map((clipId) => ({ type: "deleteClip" as const, trackId: target.trackId, clipId, ripple })),
     );
-    dispatch({ type: "select", selection: { clipIds: [] } });
-  }, [commit, state.selection]);
+    this.update({ selection: { clipIds: [] } });
+  }
 
-  const duplicateSelected = useCallback(async () => {
-    const trackId = state.selection.trackId;
-    if (!trackId || state.selection.clipIds.length === 0) return;
-    const track = activeSequence(state.project).tracks.find((item) => item.id === trackId);
-    const selected = track?.clips.filter((clip) => state.selection.clipIds.includes(clip.id));
+  private async duplicateSelected(): Promise<void> {
+    const target = this.selectedTarget();
+    if (!target) return;
+    const track = activeSequence(this.state.project).tracks.find((item) => item.id === target.trackId);
+    const selected = track?.clips.filter((clip) => target.clipIds.includes(clip.id));
     if (!selected?.length) return;
     const from = Math.min(...selected.map((clip) => clip.startTick));
     const to = Math.max(...selected.map((clip) => clip.startTick + clip.durationTicks));
     const offset = Math.max(1, to - from);
     const duplicates = selected.map((clip) => ({ ...structuredClone(clip), id: createId("clip"), startTick: clip.startTick + offset }));
-    await commit("Duplicar clipes", duplicates.map((clip) => ({ type: "insertClip" as const, trackId, clip })));
-    dispatch({ type: "select", selection: { clipIds: duplicates.map((clip) => clip.id), trackId, assetId: duplicates[0]?.assetId } });
-  }, [commit, state.project, state.selection]);
+    await this.commit("Duplicar clipes", duplicates.map((clip) => ({ type: "insertClip" as const, trackId: target.trackId, clip })));
+    this.update({ selection: { clipIds: duplicates.map((clip) => clip.id), trackId: target.trackId, assetId: duplicates[0]?.assetId } });
+  }
 
-  const updateSelectedClip = useCallback(async (patch: Record<string, unknown>) => {
-    const clipId = state.selection.clipIds[0];
-    const trackId = state.selection.trackId;
-    if (!clipId || !trackId) return;
-    await commit("Ajustar clipe", [{ type: "updateClip", trackId, clipId, patch } as EditCommand]);
-  }, [commit, state.selection]);
+  private async updateSelectedClip(patch: Record<string, unknown>): Promise<void> {
+    const target = this.selectedTarget();
+    if (!target?.clipIds[0]) return;
+    await this.commit("Ajustar clipe", [{ type: "updateClip", trackId: target.trackId, clipId: target.clipIds[0], patch } as EditCommand]);
+  }
 
-  const undo = useCallback(async () => {
-    if (state.past.length === 0) return;
-    await commitQueueRef.current;
-    if (!isTauriRuntime()) {
-      const previous = state.past.at(-1);
-      if (previous) projectRef.current = previous;
-      dispatch({ type: "undo" });
-      return;
-    }
+  private loadProject(project: EditorProject): void {
+    this.replaceLoadedProject(project);
+    void this.hydrateAnalyses(project);
+  }
+
+  private async undo(): Promise<void> {
+    if (!this.state.canUndo) return;
+    await this.commitQueue;
     try {
-      const project = await nativeApi.undo();
-      projectRef.current = project;
-      dispatch({ type: "undoNative", project });
+      let project: EditorProject | undefined;
+      if (isTauriRuntime()) {
+        project = await nativeApi.undo();
+      } else {
+        project = this.webPast.pop();
+        if (project) this.webFuture.unshift(this.state.project);
+      }
+      if (!project) return;
+      const history = isTauriRuntime() ? await nativeApi.historyStatus() : { canUndo: this.webPast.length > 0, canRedo: this.webFuture.length > 0 };
+      this.update({ project, ...history, proposal: undefined });
     } catch (error) {
-      dispatch({ type: "error", message: errorMessage(error) });
+      this.update({ error: errorMessage(error) });
+      throw error;
     }
-  }, [state.past]);
+  }
 
-  const redo = useCallback(async () => {
-    if (state.future.length === 0) return;
-    await commitQueueRef.current;
-    if (!isTauriRuntime()) {
-      const next = state.future[0];
-      if (next) projectRef.current = next;
-      dispatch({ type: "redo" });
-      return;
-    }
+  private async redo(): Promise<void> {
+    if (!this.state.canRedo) return;
+    await this.commitQueue;
     try {
-      const project = await nativeApi.redo();
-      projectRef.current = project;
-      dispatch({ type: "redoNative", project });
+      let project: EditorProject | undefined;
+      if (isTauriRuntime()) {
+        project = await nativeApi.redo();
+      } else {
+        project = this.webFuture.shift();
+        if (project) this.webPast.push(this.state.project);
+      }
+      if (!project) return;
+      const history = isTauriRuntime() ? await nativeApi.historyStatus() : { canUndo: this.webPast.length > 0, canRedo: this.webFuture.length > 0 };
+      this.update({ project, ...history, proposal: undefined });
     } catch (error) {
-      dispatch({ type: "error", message: errorMessage(error) });
+      this.update({ error: errorMessage(error) });
+      throw error;
     }
-  }, [state.future]);
+  }
 
-  const loadProject = useCallback((project: EditorProject) => {
-    projectRef.current = project;
-    dispatch({ type: "loadProject", project });
-  }, []);
+  private setJob(job: EditorJob): void {
+    const jobs = [...this.state.jobs.filter((candidate) => candidate.id !== job.id), job].sort((left, right) => left.label.localeCompare(right.label));
+    this.update({ jobs });
+  }
 
-  const value = useMemo<EditorContextValue>(() => ({
-    ...state,
-    commit,
-    importAsset,
-    insertAsset,
-    splitSelected,
-    deleteSelected,
-    duplicateSelected,
-    updateSelectedClip,
-    setTranscript: async (transcript) => { await commit("Salvar transcrição local", [{ type: "setTranscript", transcript }]); },
-    loadProject,
-    undo,
-    redo,
-    select: (selection) => dispatch({ type: "select", selection }),
-    setPlayhead: (tick) => dispatch({ type: "playhead", tick }),
-    setPlaying: (value) => dispatch({ type: "playing", value }),
-    setZoom: (value) => dispatch({ type: "zoom", value }),
-    setLeftTab: (value) => dispatch({ type: "leftTab", value }),
-    setRightTab: (value) => dispatch({ type: "rightTab", value }),
-    addMessage: (role, text) => dispatch({ type: "message", message: { id: createId("message"), role, text, createdAt: Date.now() } }),
-    setAgentSteps: (steps) => dispatch({ type: "agentSteps", steps }),
-    setJob: (job) => dispatch({ type: "job", job }),
-    setError: (message) => dispatch({ type: "error", message }),
-    setStatus: (value) => dispatch({ type: "status", value }),
-  }), [commit, deleteSelected, duplicateSelected, importAsset, insertAsset, loadProject, redo, splitSelected, state, undo, updateSelectedClip]);
+  private setAnalysis(analysis: AssetAnalysis): void {
+    this.update({ analyses: { ...this.state.analyses, [analysis.assetId]: analysis } });
+  }
 
-  return <EditorContext.Provider value={value}>{children}</EditorContext.Provider>;
+  private async hydrateAnalyses(project: EditorProject, lifecycleVersion = this.lifecycleVersion): Promise<void> {
+    if (!isTauriRuntime()) return;
+    const entries = await Promise.all(project.assets.filter((asset) => asset.fingerprint).map(async (asset) => {
+      try {
+        const analysis = await nativeApi.analysisGet(asset.id, asset.fingerprint!);
+        return analysis ? [asset.id, analysis] as const : undefined;
+      } catch {
+        return undefined;
+      }
+    }));
+    if (this.disposed || lifecycleVersion !== this.lifecycleVersion || this.state.project.projectId !== project.projectId) return;
+    const analyses = { ...this.state.analyses };
+    for (const entry of entries) if (entry) analyses[entry[0]] = entry[1];
+    this.update({ analyses });
+    for (const asset of project.assets) {
+      if (!analyses[asset.id] && asset.path && asset.fingerprint && asset.width && asset.height) {
+        void this.startAnalysis(asset).catch(() => undefined);
+      }
+    }
+  }
+
+  private async startAnalysis(asset: MediaAsset, prompts: string[] = [], force = false): Promise<AssetAnalysis | undefined> {
+    if (!isTauriRuntime() || !asset.path || !asset.fingerprint || !asset.width || !asset.height) return;
+    const jobId = `analysis-${asset.id}`;
+    this.setJob({ id: jobId, kind: "analysis", label: `Análise local · ${asset.name}`, state: "queued", progress: 0, assetId: asset.id, stage: "scenes", cancellable: true });
+    try {
+      const analysis = await nativeApi.analysisStart({ assetId: asset.id, mediaPath: asset.path, fingerprint: asset.fingerprint, durationTicks: asset.durationTicks, prompts, force });
+      this.setAnalysis(analysis);
+      this.setJob({ id: jobId, kind: "analysis", label: `Análise local · ${asset.name}`, state: "completed", progress: 1, assetId: asset.id, stage: "ocr" });
+      this.update({ status: `Análise local de ${asset.name} concluída` });
+      return analysis;
+    } catch (error) {
+      const message = errorMessage(error);
+      const cancelled = message.toLowerCase().includes("cancel");
+      this.setJob({ id: jobId, kind: "analysis", label: `Análise local · ${asset.name}`, state: cancelled ? "cancelled" : "failed", progress: 0, detail: message, assetId: asset.id, stage: "scenes", retryable: !cancelled });
+      if (!cancelled) this.update({ error: `Análise de “${asset.name}” falhou: ${message}` });
+      throw error;
+    }
+  }
+
+  private async cancelAnalysis(assetId: string): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await nativeApi.analysisCancel(assetId);
+    const current = this.state.jobs.find((job) => job.id === `analysis-${assetId}`);
+    if (current) this.setJob({ ...current, state: "cancelled", detail: "Cancelamento solicitado" });
+  }
+
+  private async applyProposal(): Promise<void> {
+    const proposal = this.state.proposal;
+    if (!proposal) return;
+    if (proposal.baseRevision !== this.state.project.revision) {
+      const message = "A timeline mudou depois da proposta. Gere uma nova proposta antes de aplicar.";
+      this.update({ error: message });
+      throw new Error(message);
+    }
+    await this.commit(proposal.summary, proposal.operations, "agent");
+    this.update({ proposal: undefined, agentSteps: [], status: "Proposta aplicada" });
+    this.actions.addMessage("assistant", `Proposta aplicada: ${proposal.summary}`);
+  }
+
+  private rejectProposal(): void {
+    const proposal = this.state.proposal;
+    if (!proposal) return;
+    this.update({ proposal: undefined, agentSteps: [], status: "Proposta descartada" });
+    this.actions.addMessage("assistant", `Proposta descartada: ${proposal.summary}`);
+  }
 }
 
-// O provider e o hook formam uma única fronteira de estado; mantê-los juntos evita
-// expor o contexto mutável como parte da API pública.
-// eslint-disable-next-line react-refresh/only-export-components
-export function useEditor(): EditorContextValue {
-  const value = useContext(EditorContext);
-  if (!value) throw new Error("useEditor deve ser usado dentro de EditorProvider");
-  return value;
+export const EditorStoreContext = createContext<EditorStore | null>(null);
+
+function useStore(): EditorStore {
+  const store = useContext(EditorStoreContext);
+  if (!store) throw new Error("EditorProvider ausente");
+  return store;
+}
+
+export function useEditorSelector<T>(selector: (state: EditorState) => T): T {
+  const store = useStore();
+  return useSyncExternalStore(store.subscribe, () => selector(store.getSnapshot()), () => selector(store.getSnapshot()));
+}
+
+export function useEditorActions(): EditorActions {
+  return useStore().actions;
 }

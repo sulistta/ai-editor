@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useEditor } from "../context/EditorContext";
-import { scheduleAppSurfaceRefresh } from "../lib/compositor";
-import { activeSequence, createId, makeClip, sequenceDuration } from "../lib/project";
+import { useEditorActions, useEditorSelector } from "../context/EditorContext";
+import { activeSequence, applyTransaction, createId, makeClip, sequenceDuration } from "../lib/project";
 import { formatTimecode, frameDurationTicks, snapTickToFrame, ticksToSeconds } from "../lib/time";
 import type { TimelineClip, TimelineTrack } from "../types";
 import { Icon } from "./Icons";
@@ -28,8 +27,28 @@ function clipColor(track: TimelineTrack): string {
 }
 
 export function Timeline() {
-  const editor = useEditor();
-  const sequence = activeSequence(editor.project);
+  const project = useEditorSelector((state) => state.project);
+  const selection = useEditorSelector((state) => state.selection);
+  const playheadTick = useEditorSelector((state) => state.playheadTick);
+  const isPlaying = useEditorSelector((state) => state.isPlaying);
+  const zoom = useEditorSelector((state) => state.zoom);
+  const agentSteps = useEditorSelector((state) => state.agentSteps);
+  const proposal = useEditorSelector((state) => state.proposal);
+  const editor = { project, selection, playheadTick, isPlaying, zoom, agentSteps, proposal, ...useEditorActions() };
+  const sequence = activeSequence(project);
+  const proposalProject = useMemo(() => {
+    if (!proposal || proposal.baseRevision !== project.revision) return undefined;
+    try {
+      return applyTransaction(project, {
+        id: `preview-${proposal.id}`,
+        baseRevision: proposal.baseRevision,
+        source: "agent",
+        label: proposal.summary,
+        commands: proposal.operations,
+      });
+    } catch { return undefined; }
+  }, [project, proposal]);
+  const proposalSequence = proposalProject ? activeSequence(proposalProject) : undefined;
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragRef = useRef<DragOperation | null>(null);
@@ -37,10 +56,10 @@ export function Timeline() {
   const pendingScrollRef = useRef({ scrollLeft: 0, scrollTop: 0 });
   const scrollFrameRef = useRef<number | undefined>(undefined);
   const [viewport, setViewport] = useState({ width: 900, height: 180, scrollLeft: 0, scrollTop: 0 });
-  const pixelsPerSecond = 72 * editor.zoom;
-  const duration = Math.max(sequenceDuration(sequence), 60 * editor.project.settings.timebase);
+  const pixelsPerSecond = 72 * zoom;
+  const duration = Math.max(sequenceDuration(sequence), proposalSequence ? sequenceDuration(proposalSequence) : 0, 60 * project.settings.timebase);
   const virtualWidth = GUTTER + ticksToSeconds(duration) * pixelsPerSecond + 400;
-  const height = RULER + sequence.tracks.length * TRACK_HEIGHT;
+  const height = RULER + Math.max(sequence.tracks.length, proposalSequence?.tracks.length ?? 0) * TRACK_HEIGHT;
   const canvasHeight = Math.max(1, viewport.height - SCROLLBAR_SIZE);
   const maxScrollTop = Math.max(0, height - canvasHeight);
   const canvasWidth = Math.max(1, viewport.width - (maxScrollTop > 0 ? SCROLLBAR_SIZE : 0));
@@ -82,7 +101,7 @@ export function Timeline() {
     });
   }, [maxScrollLeft, maxScrollTop, setViewport]);
 
-  const draw = useCallback(() => {
+  const draw = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ratio = window.devicePixelRatio || 1;
@@ -123,7 +142,7 @@ export function Timeline() {
       context.stroke();
       if (major) {
         context.fillStyle = "#81857a";
-        context.fillText(formatTimecode(second * editor.project.settings.timebase, editor.project.settings.fpsNum, editor.project.settings.fpsDen).slice(3, -3), x + 4, 11);
+        context.fillText(formatTimecode(second * project.settings.timebase, project.settings.fpsNum, project.settings.fpsDen).slice(3, -3), x + 4, 11);
       }
     }
 
@@ -167,12 +186,12 @@ export function Timeline() {
         if (x + width < GUTTER || x > canvasWidth) continue;
         context.save();
         context.globalAlpha = track.hidden || (track.kind === "audio" && track.muted) ? 0.42 : 1;
-        const selected = editor.selection.clipIds.includes(clip.id);
+        const selected = selection.clipIds.includes(clip.id);
         context.fillStyle = selected ? "#403b20" : clipColor(track);
         context.fillRect(x, y + 5, width, TRACK_HEIGHT - 10);
         context.strokeStyle = selected ? "#ffb800" : "#4a4d44";
         context.strokeRect(x + 0.5, y + 5.5, width - 1, TRACK_HEIGHT - 11);
-        const clipAsset = editor.project.assets.find((asset) => asset.id === clip.assetId);
+        const clipAsset = project.assets.find((asset) => asset.id === clip.assetId);
         const waveform = clipAsset?.waveform;
         const assetDuration = clipAsset?.durationTicks ?? 0;
         if (track.kind === "audio" && waveform?.length && assetDuration > 0 && width > 8) {
@@ -199,7 +218,7 @@ export function Timeline() {
         context.fillStyle = selected ? "#ffdc71" : "#d1d4cc";
         context.fillText(clip.name, x + 7, y + 17);
         context.fillStyle = selected ? "#c8ad53" : "#777b72";
-        context.fillText(formatTimecode(duration, editor.project.settings.fpsNum, editor.project.settings.fpsDen), x + 7, y + 35);
+        context.fillText(formatTimecode(duration, project.settings.fpsNum, project.settings.fpsDen), x + 7, y + 35);
         context.restore();
         if (clip.transitionIn) {
           context.fillStyle = "#ffb800";
@@ -222,7 +241,59 @@ export function Timeline() {
       context.restore();
     });
 
-    const playheadX = GUTTER + ticksToSeconds(editor.playheadTick) * pixelsPerSecond - scrollLeft;
+    if (proposalSequence) {
+      proposalSequence.tracks.forEach((track, trackIndex) => {
+        const currentTrack = sequence.tracks.find((candidate) => candidate.id === track.id);
+        const y = RULER + trackIndex * TRACK_HEIGHT - scrollTop;
+        if (y + TRACK_HEIGHT <= RULER || y >= canvasHeight) return;
+        for (const clip of track.clips) {
+          const current = currentTrack?.clips.find((candidate) => candidate.id === clip.id);
+          const unchanged = current && current.startTick === clip.startTick && current.sourceInTick === clip.sourceInTick
+            && current.durationTicks === clip.durationTicks && current.speed === clip.speed
+            && JSON.stringify(current.transform) === JSON.stringify(clip.transform)
+            && JSON.stringify(current.keyframes) === JSON.stringify(clip.keyframes)
+            && JSON.stringify(current.effects) === JSON.stringify(clip.effects);
+          if (unchanged) continue;
+          const x = GUTTER + ticksToSeconds(clip.startTick) * pixelsPerSecond - scrollLeft;
+          const width = Math.max(4, ticksToSeconds(clip.durationTicks) * pixelsPerSecond);
+          if (x + width < GUTTER || x > canvasWidth) continue;
+          context.save();
+          context.fillStyle = "rgba(255,184,0,.12)";
+          context.fillRect(x, y + 5, width, TRACK_HEIGHT - 10);
+          context.strokeStyle = "#ffb800";
+          context.setLineDash([5, 3]);
+          context.strokeRect(x + 0.5, y + 5.5, width - 1, TRACK_HEIGHT - 11);
+          context.setLineDash([]);
+          context.fillStyle = "#ffce52";
+          context.fillText(current ? "PROPOSTO" : `NOVO · ${clip.name}`, x + 7, y + 17);
+          context.restore();
+        }
+        for (const clip of currentTrack?.clips ?? []) {
+          if (track.clips.some((candidate) => candidate.id === clip.id)) continue;
+          const x = GUTTER + ticksToSeconds(clip.startTick) * pixelsPerSecond - scrollLeft;
+          const width = Math.max(4, ticksToSeconds(clip.durationTicks) * pixelsPerSecond);
+          if (x + width < GUTTER || x > canvasWidth) continue;
+          context.save();
+          context.strokeStyle = "#a67b32";
+          context.setLineDash([3, 3]);
+          context.strokeRect(x + 0.5, y + 5.5, width - 1, TRACK_HEIGHT - 11);
+          context.beginPath();
+          context.moveTo(x + 2, y + 8);
+          context.lineTo(x + width - 2, y + TRACK_HEIGHT - 8);
+          context.stroke();
+          context.restore();
+        }
+      });
+      for (const evidence of proposal?.evidence ?? []) {
+        const from = GUTTER + ticksToSeconds(evidence.startTick) * pixelsPerSecond - scrollLeft;
+        const to = GUTTER + ticksToSeconds(evidence.endTick) * pixelsPerSecond - scrollLeft;
+        if (to < GUTTER || from > canvasWidth) continue;
+        context.fillStyle = "#ffb800";
+        context.fillRect(Math.max(GUTTER, from), RULER - 4, Math.max(2, Math.min(canvasWidth, to) - Math.max(GUTTER, from)), 3);
+      }
+    }
+
+    const playheadX = GUTTER + ticksToSeconds(playheadTick) * pixelsPerSecond - scrollLeft;
     if (playheadX >= GUTTER && playheadX <= canvasWidth) {
       context.strokeStyle = "#ffb800";
       context.lineWidth = 1;
@@ -234,7 +305,7 @@ export function Timeline() {
       context.fillRect(playheadX - 3, 0, 7, 5);
     }
 
-    const activeStep = editor.agentSteps.find((step) => step.state === "running" && step.range);
+    const activeStep = agentSteps.find((step) => step.state === "running" && step.range);
     if (activeStep?.range) {
       const from = GUTTER + ticksToSeconds(activeStep.range.startTick) * pixelsPerSecond - scrollLeft;
       const to = GUTTER + ticksToSeconds(activeStep.range.endTick) * pixelsPerSecond - scrollLeft;
@@ -245,13 +316,9 @@ export function Timeline() {
       context.strokeRect(from + 0.5, RULER + 0.5, Math.max(1, to - from - 1), canvasHeight - RULER - 1);
       context.setLineDash([]);
     }
-  }, [canvasHeight, canvasWidth, editor.agentSteps, editor.playheadTick, editor.project.assets, editor.project.settings, editor.selection.clipIds, pixelsPerSecond, scrollLeft, scrollTop, sequence.tracks]);
+  };
 
-  useEffect(() => draw(), [draw]);
-
-  useEffect(() => {
-    scheduleAppSurfaceRefresh();
-  }, [scrollLeft, scrollTop]);
+  useEffect(() => { draw(); });
 
   useEffect(() => {
     if (!editor.isPlaying) return;

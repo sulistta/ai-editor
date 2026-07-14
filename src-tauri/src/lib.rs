@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod agent;
+mod analysis;
 mod domain;
 mod error;
 mod media;
@@ -10,8 +11,9 @@ mod runtime;
 mod transcription;
 
 use agent::{agent_plan, gemini_key_clear, gemini_key_set};
+use analysis::{analysis_cancel, analysis_get, analysis_start, AnalysisState};
 use domain::{
-    project_apply, project_autosave, project_new, project_open, project_redo, project_save, project_snapshot,
+    project_apply, project_autosave, project_history_status, project_new, project_open, project_redo, project_save, project_snapshot,
     project_undo, AppState,
 };
 use media::{media_import, media_import_url, media_probe, media_proxy};
@@ -25,9 +27,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .manage(AnalysisState::default())
         .manage(ModelDownloadState::default())
         .invoke_handler(tauri::generate_handler![
             project_snapshot,
+            project_history_status,
             project_new,
             project_apply,
             project_undo,
@@ -39,6 +43,9 @@ pub fn run() {
             media_import,
             media_import_url,
             media_proxy,
+            analysis_get,
+            analysis_start,
+            analysis_cancel,
             model_catalog,
             model_status,
             model_download,

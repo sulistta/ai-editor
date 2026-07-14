@@ -1,13 +1,14 @@
 import type { ReactNode, SVGProps } from "react";
 
 export type IconName =
-  | "media" | "effects" | "captions" | "transitions" | "inspector" | "chat"
+  | "media" | "analysis" | "effects" | "captions" | "transitions" | "inspector" | "chat"
   | "play" | "pause" | "split" | "trash" | "undo" | "redo" | "save"
   | "export" | "open" | "plus" | "search" | "lock" | "eye" | "volume" | "settings"
   | "stop" | "send" | "transcript" | "video" | "audio" | "close";
 
 const paths: Record<IconName, ReactNode> = {
   media: <><rect x="3" y="5" width="18" height="14"/><path d="m9 9 6 3-6 3Z"/></>,
+  analysis: <><path d="M4 4h6v6H4ZM14 4h6v6h-6ZM4 14h6v6H4Z"/><path d="m14 17 2 2 4-5"/></>,
   effects: <><path d="M4 17 17 4"/><path d="m14 4 3 3"/><path d="M4 7h4M6 5v4M15 15h5M17.5 12.5v5"/></>,
   captions: <><rect x="3" y="5" width="18" height="14"/><path d="M7 10h4M7 14h3M14 10h3M13 14h4"/></>,
   transitions: <><path d="M3 6h8l-3 6 3 6H3l3-6Z"/><path d="M21 6h-8l3 6-3 6h8l-3-6Z"/></>,

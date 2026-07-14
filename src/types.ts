@@ -1,7 +1,8 @@
 export const TICKS_PER_SECOND = 240_000;
+export const PROJECT_SCHEMA_VERSION = 2 as const;
 
 export type TrackKind = "video" | "audio" | "caption";
-export type JobState = "idle" | "queued" | "running" | "completed" | "failed" | "cancelled";
+export type JobState = "idle" | "queued" | "running" | "completed" | "failed" | "cancelled" | "skipped";
 
 export interface ProjectSettings {
   width: number;
@@ -41,6 +42,15 @@ export interface Transform {
   cropLeft: number;
 }
 
+export type KeyframeEasing = "linear" | "easeIn" | "easeOut" | "easeInOut";
+
+export interface TransformKeyframe {
+  id: string;
+  offsetTick: number;
+  easing: KeyframeEasing;
+  value: Transform;
+}
+
 export interface EffectInstance {
   id: string;
   kind: "exposure" | "contrast" | "saturation" | "temperature" | "chromaKey" | "blur";
@@ -65,6 +75,7 @@ export interface TimelineClip {
   speed: number;
   volume: number;
   transform: Transform;
+  keyframes: TransformKeyframe[];
   effects: EffectInstance[];
   transitionIn?: ClipTransition;
   transitionOut?: ClipTransition;
@@ -141,7 +152,7 @@ export interface Transcript {
 }
 
 export interface EditorProject {
-  schemaVersion: 1;
+  schemaVersion: typeof PROJECT_SCHEMA_VERSION;
   projectId: string;
   name: string;
   revision: number;
@@ -150,6 +161,11 @@ export interface EditorProject {
   sequences: Sequence[];
   activeSequenceId: string;
   transcripts: Transcript[];
+}
+
+export interface HistoryStatus {
+  canUndo: boolean;
+  canRedo: boolean;
 }
 
 export interface Selection {
@@ -171,15 +187,20 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   text: string;
   createdAt: number;
+  question?: AgentQuestion;
 }
 
 export interface EditorJob {
   id: string;
-  kind: "proxy" | "download" | "model" | "transcription" | "render" | "agent";
+  kind: "proxy" | "download" | "model" | "transcription" | "analysis" | "render" | "agent";
   label: string;
   state: JobState;
   progress: number;
   detail?: string;
+  assetId?: string;
+  stage?: AnalysisStageKind;
+  cancellable?: boolean;
+  retryable?: boolean;
 }
 
 export type EditCommand =
@@ -236,10 +257,102 @@ export interface AgentQuestion {
   options: string[];
 }
 
-export interface GeminiPlan {
-  message: string;
+export type AnalysisStageKind = "scenes" | "objects" | "ocr";
+
+export interface AnalysisStage {
+  kind: AnalysisStageKind;
+  state: JobState;
+  progress: number;
+  detail?: string;
+  updatedAt: number;
+}
+
+export interface NormalizedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface VisualObservation {
+  id: string;
+  kind: "object" | "person" | "text";
+  label: string;
+  text?: string;
+  confidence: number;
+  rect: NormalizedRect;
+  startTick: number;
+  endTick: number;
+  trackId?: string;
+}
+
+export interface SceneAnalysis {
+  id: string;
+  startTick: number;
+  endTick: number;
+  representativeTick: number;
+  motionScore: number;
+  thumbnailPath?: string;
+  observations: VisualObservation[];
+}
+
+export interface AssetAnalysis {
+  schemaVersion: 1;
+  assetId: string;
+  sourceFingerprint: string;
+  pipelineVersion: string;
+  stages: AnalysisStage[];
+  scenes: SceneAnalysis[];
+  updatedAt: number;
+}
+
+export interface AnalysisProgressEvent {
+  job: EditorJob;
+  analysis?: AssetAnalysis;
+}
+
+export interface ProposalEvidence {
+  id: string;
+  kind: "timeline" | "transcript" | "scene" | "object" | "ocr";
+  label: string;
+  startTick: number;
+  endTick: number;
+  assetId?: string;
+  sceneId?: string;
+  observationId?: string;
+}
+
+export interface EditProposal {
+  id: string;
+  baseRevision: number;
+  summary: string;
+  rationale: string;
+  confidence: "low" | "medium" | "high";
   operations: EditCommand[];
+  evidence: ProposalEvidence[];
+  createdAt: number;
+}
+
+export interface AgentResponse {
+  message: string;
+  proposal?: EditProposal;
   question?: AgentQuestion;
+  analysisRequest?: AgentAnalysisRequest;
+}
+
+export interface AgentAnalysisRequest {
+  assetId: string;
+  prompts: string[];
+  reason: string;
+}
+
+export interface AnalysisRequest {
+  assetId: string;
+  mediaPath: string;
+  fingerprint: string;
+  durationTicks: number;
+  prompts?: string[];
+  force?: boolean;
 }
 
 export interface DependencyStatus {
@@ -253,6 +366,8 @@ export interface RuntimeStatus {
   whisper: DependencyStatus;
   model: DependencyStatus;
   youtube: DependencyStatus;
+  ocr: DependencyStatus;
+  objects: DependencyStatus;
 }
 
 export interface WhisperModelInfo {

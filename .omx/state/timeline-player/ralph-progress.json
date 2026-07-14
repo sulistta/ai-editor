@@ -1,25 +1,27 @@
 {
-  "score": 94,
+  "score": 95,
   "verdict": "pass",
   "category_match": true,
   "threshold": 90,
   "threshold_passed": true,
   "differences": [
-    "A captura de validação usa o projeto vazio, enquanto a referência contém uma mídia ativa na timeline.",
-    "O quadro de programa agora permanece preto e nomeia o estado vazio sem usar a seleção da biblioteca como preview implícito.",
-    "O gutter da timeline ficou mais largo para expor bloqueio, visibilidade e mute como controles independentes."
+    "O painel esquerdo agora possui uma quinta aba para análise local; o rótulo visual de Transições é abreviado, mas o nome completo permanece no título, tooltip e aria-label.",
+    "O monitor ganhou moldura de programa e safe area mais explícitas que a referência original.",
+    "O chat informa que usa metadados locais e mantém as ações editoriais como propostas revisáveis."
   ],
   "suggestions": [
-    "Preservar o preto do programa durante gaps em futuras mudanças de navegação temporal.",
-    "Manter os indicadores de transcrição como estado informativo, sem reintroduzir uma ação manual por asset."
+    "Preservar a abreviação das abas somente enquanto o painel lateral estiver na largura mínima.",
+    "Manter a moldura do monitor independente da camada de vídeo para evitar regressões do compositor."
   ],
-  "next_actions": [
-    "Validar o relógio de gaps, a troca entre clipes e a mixagem de áudio com testes automatizados e build desktop.",
-    "Confirmar typecheck, lint e builds de produção após o fechamento da implementação."
+  "next_actions": [],
+  "reasoning": "A implementação preserva a linguagem industrial, a hierarquia monitor-transporte-timeline e o contraste da referência, ao mesmo tempo que acomoda análise local e revisão de propostas sem colisões ou ornamento excessivo. Tanto no extremo direito da timeline quanto após o último frame de um MP4 real, a superfície permaneceu visível com app-shell em display grid, opacity 1 e transform none.",
+  "generated_screenshot": "/tmp/ai-editor-current-final2.png",
+  "interaction_screenshots": [
+    "/tmp/ai-editor-scrolled.png",
+    "/tmp/ai-editor-player-ended.png",
+    "/tmp/ai-editor-min-viewport.png"
   ],
-  "reasoning": "A captura preserva integralmente a linguagem Industrial da referência, mantém a hierarquia monitor-transporte-timeline e torna os controles de faixa legíveis sem adicionar ornamento. O estado vazio é coerente com o programa real e não sugere conteúdo fora da timeline.",
-  "generated_screenshot": "/tmp/ai-editor-timeline-player.png",
   "reference_images": [
-    "/home/vitor/.tmp/bun/codex-clipboard-7tjmuY.png"
+    "/tmp/ai-editor-reference.png"
   ]
 }

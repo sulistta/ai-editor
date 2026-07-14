@@ -3,8 +3,11 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   EditTransaction,
   EditorProject,
+  HistoryStatus,
   ChatMessage,
-  GeminiPlan,
+  AgentResponse,
+  AnalysisRequest,
+  AssetAnalysis,
   MediaAsset,
   MediaProbe,
   RuntimeStatus,
@@ -60,6 +63,7 @@ export async function chooseExportPath(defaultPath?: string): Promise<string | n
 
 export const nativeApi = {
   snapshot: () => invoke<EditorProject>("project_snapshot"),
+  historyStatus: () => invoke<HistoryStatus>("project_history_status"),
   newProject: (name: string) => invoke<EditorProject>("project_new", { name }),
   apply: (transaction: EditTransaction) => invoke<EditorProject>("project_apply", { transaction }),
   undo: () => invoke<EditorProject>("project_undo"),
@@ -77,7 +81,10 @@ export const nativeApi = {
   modelActivate: (modelId: string) => invoke<WhisperModelStatus>("model_activate", { modelId }),
   modelDelete: (modelId: string) => invoke<void>("model_delete", { modelId }),
   transcribe: (request: TranscriptionRequest) => invoke<Transcript>("transcription_start", { request }),
-  planEdit: (prompt: string, project: EditorProject, history: ChatMessage[], selection: Selection) => invoke<GeminiPlan>("agent_plan", { prompt, project, history: history.map(({ role, text }) => ({ role, text })), selection }),
+  analysisGet: (assetId: string, fingerprint: string) => invoke<AssetAnalysis | null>("analysis_get", { assetId, fingerprint }),
+  analysisStart: (request: AnalysisRequest) => invoke<AssetAnalysis>("analysis_start", { request }),
+  analysisCancel: (assetId: string) => invoke<void>("analysis_cancel", { assetId }),
+  planEdit: (prompt: string, project: EditorProject, history: ChatMessage[], selection: Selection) => invoke<AgentResponse>("agent_plan", { prompt, project, history: history.map(({ role, text }) => ({ role, text })), selection }),
   setGeminiKey: (apiKey: string) => invoke<void>("gemini_key_set", { apiKey }),
   render: (outputPath: string) => invoke<void>("render_start", { outputPath }),
   cancelRender: () => invoke<void>("render_cancel"),

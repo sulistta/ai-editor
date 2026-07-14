@@ -1,4 +1,4 @@
-import { EditorProvider } from "./context/EditorContext";
+import { EditorProvider } from "./context/EditorProvider";
 import { Workspace } from "./components/Workspace";
 
 export default function App() {

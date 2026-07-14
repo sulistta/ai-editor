@@ -1,7 +1,7 @@
 use crate::{error::AppError, media::allow_asset_file};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::Path, sync::{atomic::AtomicBool, Mutex}};
+use std::{collections::HashSet, path::Path, sync::{atomic::AtomicBool, Mutex}};
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -42,7 +42,7 @@ pub struct MediaAsset {
     pub offline: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Transform {
     pub x: f64,
@@ -54,6 +54,15 @@ pub struct Transform {
     pub crop_right: f64,
     pub crop_bottom: f64,
     pub crop_left: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformKeyframe {
+    pub id: String,
+    pub offset_tick: i64,
+    pub easing: String,
+    pub value: Transform,
 }
 
 impl Default for Transform {
@@ -90,6 +99,7 @@ pub struct TimelineClip {
     pub speed: f64,
     pub volume: f64,
     pub transform: Transform,
+    pub keyframes: Vec<TransformKeyframe>,
     pub effects: Vec<EffectInstance>,
     #[serde(default)]
     pub transition_in: Option<ClipTransition>,
@@ -217,7 +227,7 @@ impl EditorProject {
     pub fn empty(name: impl Into<String>) -> Self {
         let sequence_id = id("sequence");
         Self {
-            schema_version: 1,
+            schema_version: 2,
             project_id: id("project"),
             name: name.into(),
             revision: 0,
@@ -257,18 +267,130 @@ fn valid_caption_style(style: &CaptionStyle) -> bool {
         && matches!(style.position.as_str(), "top" | "center" | "bottom")
 }
 
-fn validate_project(project: &EditorProject) -> Result<(), AppError> {
-    if project.schema_version != 1 { return Err(AppError::new("UNSUPPORTED_SCHEMA", "Versão do projeto não suportada")); }
-    if project.settings.timebase != TICKS_PER_SECOND { return Err(AppError::new("INVALID_TIMEBASE", "O projeto usa uma base temporal incompatível")); }
-    let sequence = project.active_sequence().ok_or_else(|| AppError::new("SEQUENCE_NOT_FOUND", "A sequência ativa não existe"))?;
-    if !valid_caption_style(&sequence.caption_style) { return Err(AppError::new("INVALID_CAPTION_STYLE", "Estilo de legenda inválido")); }
-    for track in &sequence.tracks {
-        if !matches!(track.kind.as_str(), "video" | "audio" | "caption") { return Err(AppError::new("INVALID_TRACK_KIND", format!("Tipo de faixa inválido: {}", track.kind))); }
-        for clip in &track.clips {
-            if clip.duration_ticks <= 0 || clip.start_tick < 0 || clip.source_in_tick < 0 || !clip.speed.is_finite() || clip.speed <= 0.0 {
-                return Err(AppError::new("INVALID_CLIP", format!("Clipe inválido: {}", clip.name)));
+fn valid_transform(transform: &Transform, settings: &ProjectSettings) -> bool {
+    let finite = [transform.x, transform.y, transform.scale, transform.rotation, transform.opacity, transform.crop_top, transform.crop_right, transform.crop_bottom, transform.crop_left]
+        .into_iter().all(f64::is_finite);
+    finite
+        && transform.x.abs() <= settings.width as f64 * 10.0
+        && transform.y.abs() <= settings.height as f64 * 10.0
+        && (0.01..=10.0).contains(&transform.scale)
+        && (-360.0..=360.0).contains(&transform.rotation)
+        && (0.0..=1.0).contains(&transform.opacity)
+        && [transform.crop_top, transform.crop_right, transform.crop_bottom, transform.crop_left].into_iter().all(|value| (0.0..=0.49).contains(&value))
+}
+
+fn easing_progress(value: f64, easing: &str) -> f64 {
+    let progress = value.clamp(0.0, 1.0);
+    match easing {
+        "easeIn" => progress * progress,
+        "easeOut" => 1.0 - (1.0 - progress) * (1.0 - progress),
+        "easeInOut" if progress < 0.5 => 2.0 * progress * progress,
+        "easeInOut" => 1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0,
+        _ => progress,
+    }
+}
+
+fn interpolate_transform(from: &Transform, to: &Transform, progress: f64, easing: &str) -> Transform {
+    let amount = easing_progress(progress, easing);
+    let interpolate = |left: f64, right: f64| left + (right - left) * amount;
+    Transform {
+        x: interpolate(from.x, to.x), y: interpolate(from.y, to.y), scale: interpolate(from.scale, to.scale),
+        rotation: interpolate(from.rotation, to.rotation), opacity: interpolate(from.opacity, to.opacity),
+        crop_top: interpolate(from.crop_top, to.crop_top), crop_right: interpolate(from.crop_right, to.crop_right),
+        crop_bottom: interpolate(from.crop_bottom, to.crop_bottom), crop_left: interpolate(from.crop_left, to.crop_left),
+    }
+}
+
+pub(crate) fn transform_at_offset(clip: &TimelineClip, offset_tick: i64) -> Transform {
+    let mut previous_tick = 0;
+    let mut previous = clip.transform.clone();
+    for keyframe in &clip.keyframes {
+        if offset_tick <= keyframe.offset_tick {
+            let span = keyframe.offset_tick - previous_tick;
+            if span <= 0 { return keyframe.value.clone(); }
+            return interpolate_transform(&previous, &keyframe.value, (offset_tick - previous_tick) as f64 / span as f64, &keyframe.easing);
+        }
+        previous_tick = keyframe.offset_tick;
+        previous = keyframe.value.clone();
+    }
+    previous
+}
+
+fn normalize_clip_timing(clip: &mut TimelineClip) {
+    clip.keyframes.retain(|keyframe| keyframe.offset_tick >= 0 && keyframe.offset_tick <= clip.duration_ticks);
+    clip.keyframes.sort_by_key(|keyframe| keyframe.offset_tick);
+    clip.keyframes.dedup_by_key(|keyframe| keyframe.offset_tick);
+    if let Some(transition) = &mut clip.transition_in { transition.duration_ticks = transition.duration_ticks.min(clip.duration_ticks).max(1); }
+    if let Some(transition) = &mut clip.transition_out { transition.duration_ticks = transition.duration_ticks.min(clip.duration_ticks).max(1); }
+}
+
+fn truncate_clip_animation(clip: &mut TimelineClip, duration_ticks: i64, boundary_id: String) {
+    if !clip.keyframes.iter().any(|keyframe| keyframe.offset_tick > duration_ticks) { return; }
+    let boundary = transform_at_offset(clip, duration_ticks);
+    clip.keyframes.retain(|keyframe| keyframe.offset_tick <= duration_ticks);
+    if !clip.keyframes.iter().any(|keyframe| keyframe.offset_tick == duration_ticks) {
+        clip.keyframes.push(TransformKeyframe { id: boundary_id, offset_tick: duration_ticks, easing: "linear".into(), value: boundary });
+    }
+}
+
+pub(crate) fn validate_project(project: &EditorProject) -> Result<(), AppError> {
+    if project.schema_version != 2 { return Err(AppError::new("UNSUPPORTED_SCHEMA", "Versão do projeto não suportada")); }
+    if project.settings.timebase != TICKS_PER_SECOND || project.settings.width == 0 || project.settings.height == 0 || project.settings.fps_num == 0 || project.settings.fps_den == 0 || project.settings.sample_rate == 0 {
+        return Err(AppError::new("INVALID_PROJECT_SETTINGS", "As configurações do projeto são incompatíveis"));
+    }
+    project.active_sequence().ok_or_else(|| AppError::new("SEQUENCE_NOT_FOUND", "A sequência ativa não existe"))?;
+    let mut asset_ids = HashSet::new();
+    for asset in &project.assets {
+        if asset.id.is_empty() || !asset_ids.insert(asset.id.as_str()) || asset.duration_ticks <= 0 || asset.width.is_some() != asset.height.is_some() {
+            return Err(AppError::new("INVALID_ASSET", format!("Mídia inválida ou duplicada: {}", asset.name)));
+        }
+    }
+    let mut sequence_ids = HashSet::new();
+    let mut track_ids = HashSet::new();
+    let mut clip_ids = HashSet::new();
+    for sequence in &project.sequences {
+        if sequence.id.is_empty() || !sequence_ids.insert(sequence.id.as_str()) { return Err(AppError::new("INVALID_SEQUENCE", "Sequência inválida ou duplicada")); }
+        if !valid_caption_style(&sequence.caption_style) { return Err(AppError::new("INVALID_CAPTION_STYLE", "Estilo de legenda inválido")); }
+        if sequence.captions.iter().any(|caption| caption.id.is_empty() || caption.start_tick < 0 || caption.end_tick <= caption.start_tick || caption.text.trim().is_empty()) {
+            return Err(AppError::new("INVALID_CAPTION", "A sequência contém uma legenda inválida"));
+        }
+        for track in &sequence.tracks {
+            if track.id.is_empty() || !track_ids.insert(track.id.as_str()) { return Err(AppError::new("INVALID_TRACK", "Faixa inválida ou duplicada")); }
+            if !matches!(track.kind.as_str(), "video" | "audio" | "caption") { return Err(AppError::new("INVALID_TRACK_KIND", format!("Tipo de faixa inválido: {}", track.kind))); }
+            for clip in &track.clips {
+                if clip.id.is_empty() || !clip_ids.insert(clip.id.as_str()) || clip.duration_ticks <= 0 || clip.start_tick < 0 || clip.source_in_tick < 0 || !clip.speed.is_finite() || !(0.05..=20.0).contains(&clip.speed) || !clip.volume.is_finite() || !(0.0..=4.0).contains(&clip.volume) {
+                    return Err(AppError::new("INVALID_CLIP", format!("Clipe inválido ou duplicado: {}", clip.name)));
+                }
+                let asset = project.assets.iter().find(|asset| asset.id == clip.asset_id).ok_or_else(|| AppError::new("ASSET_NOT_FOUND", format!("Asset ausente para {}", clip.name)))?;
+                let source_end = clip.source_in_tick.saturating_add((clip.duration_ticks as f64 * clip.speed).round() as i64);
+                if source_end > asset.duration_ticks + 1 || !valid_transform(&clip.transform, &project.settings) {
+                    return Err(AppError::new("INVALID_CLIP", format!("Duração de fonte ou transformação inválida em {}", clip.name)));
+                }
+                let mut previous_tick = -1;
+                for keyframe in &clip.keyframes {
+                    if keyframe.id.is_empty() || keyframe.offset_tick < 0 || keyframe.offset_tick > clip.duration_ticks || keyframe.offset_tick <= previous_tick || !valid_transform(&keyframe.value, &project.settings) {
+                        return Err(AppError::new("INVALID_KEYFRAME", format!("Keyframes inválidos ou fora de ordem em {}", clip.name)));
+                    }
+                    if !matches!(keyframe.easing.as_str(), "linear" | "easeIn" | "easeOut" | "easeInOut") {
+                        return Err(AppError::new("INVALID_KEYFRAME", format!("Easing inválido em {}", clip.name)));
+                    }
+                    previous_tick = keyframe.offset_tick;
+                }
+                if clip.effects.iter().any(|effect| effect.id.is_empty() || !effect.value.is_finite() || !matches!(effect.kind.as_str(), "exposure" | "contrast" | "saturation" | "temperature" | "chromaKey" | "blur")) {
+                    return Err(AppError::new("INVALID_EFFECT", format!("Efeito inválido em {}", clip.name)));
+                }
+                for transition in [clip.transition_in.as_ref(), clip.transition_out.as_ref()].into_iter().flatten() {
+                    if transition.duration_ticks <= 0 || transition.duration_ticks > clip.duration_ticks || !matches!(transition.kind.as_str(), "crossDissolve" | "dipToBlack" | "slide" | "audioCrossfade") {
+                        return Err(AppError::new("INVALID_TRANSITION", format!("Transição inválida em {}", clip.name)));
+                    }
+                }
             }
-            if !project.assets.iter().any(|asset| asset.id == clip.asset_id) { return Err(AppError::new("ASSET_NOT_FOUND", format!("Asset ausente para {}", clip.name))); }
+        }
+    }
+    for transcript in &project.transcripts {
+        let duration = project.assets.iter().find(|asset| asset.id == transcript.asset_id).map(|asset| asset.duration_ticks).ok_or_else(|| AppError::new("ASSET_NOT_FOUND", "A transcrição referencia uma mídia inexistente"))?;
+        if transcript.segments.iter().any(|segment| segment.start_tick < 0 || segment.end_tick <= segment.start_tick || segment.end_tick > duration || segment.text.trim().is_empty()) {
+            return Err(AppError::new("INVALID_TRANSCRIPT", "A transcrição contém segmentos inválidos"));
         }
     }
     Ok(())
@@ -312,6 +434,7 @@ struct ClipPatch {
     speed: Option<f64>,
     volume: Option<f64>,
     transform: Option<Transform>,
+    keyframes: Option<Vec<TransformKeyframe>>,
     effects: Option<Vec<EffectInstance>>,
     transition_in: Option<ClipTransition>,
     transition_out: Option<ClipTransition>,
@@ -394,8 +517,24 @@ pub fn apply_command(project: &mut EditorProject, command: EditCommand) -> Resul
         EditCommand::TrimClip { track_id, clip_id, source_in_tick, duration_ticks } => {
             let track = editable_track_mut(project, &track_id)?;
             let clip = track.clips.iter_mut().find(|item| item.id == clip_id).ok_or_else(|| AppError::new("CLIP_NOT_FOUND", "Clipe não encontrado"))?;
-            clip.source_in_tick = source_in_tick.max(0);
-            clip.duration_ticks = duration_ticks.max(1);
+            let next_source_in = source_in_tick.max(0);
+            let shifted_ticks = ((next_source_in - clip.source_in_tick) as f64 / clip.speed).round() as i64;
+            if shifted_ticks > 0 {
+                let next_base = transform_at_offset(clip, shifted_ticks);
+                clip.keyframes = clip.keyframes.iter().filter(|keyframe| keyframe.offset_tick > shifted_ticks).cloned().map(|mut keyframe| {
+                    keyframe.offset_tick -= shifted_ticks;
+                    keyframe
+                }).collect();
+                clip.transform = next_base;
+            } else if shifted_ticks < 0 {
+                for keyframe in &mut clip.keyframes { keyframe.offset_tick -= shifted_ticks; }
+            }
+            clip.source_in_tick = next_source_in;
+            let next_duration = duration_ticks.max(1);
+            let boundary_id = format!("{}-trim-boundary", clip.id);
+            truncate_clip_animation(clip, next_duration, boundary_id);
+            clip.duration_ticks = next_duration;
+            normalize_clip_timing(clip);
         }
         EditCommand::SplitClip { track_id, clip_id, at_tick, right_clip_id } => {
             let track = editable_track_mut(project, &track_id)?;
@@ -404,11 +543,22 @@ pub fn apply_command(project: &mut EditorProject, command: EditCommand) -> Resul
             let left_duration = at_tick - clip.start_tick;
             if left_duration <= 0 || left_duration >= clip.duration_ticks { return Err(AppError::new("INVALID_SPLIT", "O playhead deve estar dentro do clipe")); }
             let mut right = clip.clone();
+            let right_base = transform_at_offset(clip, left_duration);
             right.id = right_clip_id;
             right.start_tick = at_tick;
             right.source_in_tick += (left_duration as f64 * clip.speed).round() as i64;
             right.duration_ticks -= left_duration;
+            right.transform = right_base;
+            right.keyframes = clip.keyframes.iter().filter(|keyframe| keyframe.offset_tick > left_duration).cloned().map(|mut keyframe| {
+                keyframe.offset_tick -= left_duration;
+                keyframe
+            }).collect();
+            right.transition_in = None;
+            truncate_clip_animation(clip, left_duration, format!("{}-split-boundary", right.id));
+            clip.transition_out = None;
             clip.duration_ticks = left_duration;
+            normalize_clip_timing(clip);
+            normalize_clip_timing(&mut right);
             track.clips.insert(index + 1, right);
         }
         EditCommand::DeleteClip { track_id, clip_id, ripple } => {
@@ -428,13 +578,38 @@ pub fn apply_command(project: &mut EditorProject, command: EditCommand) -> Resul
             let clip = track.clips.iter_mut().find(|item| item.id == clip_id).ok_or_else(|| AppError::new("CLIP_NOT_FOUND", "Clipe não encontrado"))?;
             if let Some(value) = patch.start_tick { clip.start_tick = value.max(0); }
             if let Some(value) = patch.source_in_tick { clip.source_in_tick = value.max(0); }
-            if let Some(value) = patch.duration_ticks { clip.duration_ticks = value.max(1); }
-            if let Some(value) = patch.speed { clip.speed = value.clamp(0.05, 20.0); }
+            if let Some(value) = patch.duration_ticks {
+                let next_duration = value.max(1);
+                if patch.keyframes.is_none() {
+                    let boundary_id = format!("{}-duration-boundary", clip.id);
+                    truncate_clip_animation(clip, next_duration, boundary_id);
+                }
+                clip.duration_ticks = next_duration;
+            }
+            if let Some(value) = patch.speed {
+                let next_speed = value.clamp(0.05, 20.0);
+                if patch.duration_ticks.is_none() {
+                    let old_duration = clip.duration_ticks;
+                    let next_duration = ((old_duration as f64 * clip.speed) / next_speed).round().max(1.0) as i64;
+                    for keyframe in &mut clip.keyframes { keyframe.offset_tick = (keyframe.offset_tick as f64 * next_duration as f64 / old_duration.max(1) as f64).round() as i64; }
+                    clip.duration_ticks = next_duration;
+                }
+                clip.speed = next_speed;
+            }
             if let Some(value) = patch.volume { clip.volume = value.clamp(0.0, 4.0); }
             if let Some(value) = patch.transform { clip.transform = value; }
+            if let Some(mut value) = patch.keyframes {
+                value.sort_by_key(|keyframe| keyframe.offset_tick);
+                value.dedup_by_key(|keyframe| keyframe.offset_tick);
+                if value.iter().any(|keyframe| keyframe.offset_tick < 0 || keyframe.offset_tick > clip.duration_ticks || !matches!(keyframe.easing.as_str(), "linear" | "easeIn" | "easeOut" | "easeInOut")) {
+                    return Err(AppError::new("INVALID_KEYFRAME", "Keyframes inválidos"));
+                }
+                clip.keyframes = value;
+            }
             if let Some(value) = patch.effects { clip.effects = value; }
             if let Some(value) = patch.transition_in { clip.transition_in = Some(value); }
             if let Some(value) = patch.transition_out { clip.transition_out = Some(value); }
+            normalize_clip_timing(clip);
         }
     }
     Ok(())
@@ -446,6 +621,7 @@ fn apply_transaction(project: &EditorProject, transaction: EditTransaction) -> R
     }
     let mut next = project.clone();
     for command in transaction.commands { apply_command(&mut next, command)?; }
+    validate_project(&next)?;
     next.revision += 1;
     Ok(next)
 }
@@ -456,6 +632,13 @@ pub struct AppState {
     pub future: Mutex<Vec<EditorProject>>,
     pub gemini_key: Mutex<Option<String>>,
     pub render_cancel: AtomicBool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryStatus {
+    pub can_undo: bool,
+    pub can_redo: bool,
 }
 
 impl Default for AppState {
@@ -473,6 +656,14 @@ impl Default for AppState {
 #[tauri::command]
 pub fn project_snapshot(state: tauri::State<'_, AppState>) -> Result<EditorProject, AppError> {
     Ok(state.project.lock().map_err(|_| AppError::new("STATE_POISONED", "Estado do projeto indisponível"))?.clone())
+}
+
+#[tauri::command]
+pub fn project_history_status(state: tauri::State<'_, AppState>) -> Result<HistoryStatus, AppError> {
+    Ok(HistoryStatus {
+        can_undo: !state.past.lock().map_err(|_| AppError::new("STATE_POISONED", "Histórico indisponível"))?.is_empty(),
+        can_redo: !state.future.lock().map_err(|_| AppError::new("STATE_POISONED", "Histórico indisponível"))?.is_empty(),
+    })
 }
 
 #[tauri::command]
@@ -592,6 +783,7 @@ mod tests {
                     "x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0, "opacity": 1.0,
                     "cropTop": 0.0, "cropRight": 0.0, "cropBottom": 0.0, "cropLeft": 0.0
                 },
+                "keyframes": [],
                 "effects": []
             }
         });
@@ -606,12 +798,25 @@ mod tests {
         let mut project = EditorProject::empty("Test");
         project.assets.push(MediaAsset { id: "asset".into(), name: "Test".into(), path: None, object_url: None, duration_ticks: 2_400_000, width: Some(1920), height: Some(1080), fps: Some(30.0), codec: Some("h264".into()), has_audio: true, fingerprint: None, proxy_path: None, waveform: None, offline: false });
         let track_id = project.active_sequence().unwrap().tracks[0].id.clone();
-        let clip = TimelineClip { id: "clip".into(), asset_id: "asset".into(), name: "Test".into(), start_tick: 0, source_in_tick: 0, duration_ticks: 2_400_000, speed: 1.0, volume: 1.0, transform: Transform::default(), effects: vec![], transition_in: None, transition_out: None };
+        let end_transform = Transform { x: 100.0, scale: 2.0, ..Transform::default() };
+        let clip = TimelineClip {
+            id: "clip".into(), asset_id: "asset".into(), name: "Test".into(), start_tick: 0, source_in_tick: 0,
+            duration_ticks: 2_400_000, speed: 1.0, volume: 1.0, transform: Transform::default(),
+            keyframes: vec![
+                TransformKeyframe { id: "start".into(), offset_tick: 0, easing: "linear".into(), value: Transform::default() },
+                TransformKeyframe { id: "end".into(), offset_tick: 2_400_000, easing: "linear".into(), value: end_transform },
+            ], effects: vec![], transition_in: None, transition_out: None,
+        };
         apply_command(&mut project, EditCommand::InsertClip { track_id: track_id.clone(), clip }).unwrap();
         apply_command(&mut project, EditCommand::SplitClip { track_id, clip_id: "clip".into(), at_tick: 960_000, right_clip_id: "right".into() }).unwrap();
         let clips = &project.active_sequence().unwrap().tracks[0].clips;
         assert_eq!(clips.len(), 2);
         assert_eq!(clips[0].duration_ticks + clips[1].duration_ticks, 2_400_000);
+        let left_boundary = transform_at_offset(&clips[0], clips[0].duration_ticks);
+        let right_boundary = transform_at_offset(&clips[1], 0);
+        assert!((left_boundary.x - 40.0).abs() < f64::EPSILON);
+        assert!((left_boundary.scale - 1.4).abs() < f64::EPSILON);
+        assert_eq!(left_boundary, right_boundary);
     }
 
     #[test]
@@ -632,7 +837,7 @@ mod tests {
     #[test]
     fn rejects_projects_with_dangling_clip_assets() {
         let mut project = EditorProject::empty("Test");
-        project.active_sequence_mut().unwrap().tracks[0].clips.push(TimelineClip { id: "clip".into(), asset_id: "missing".into(), name: "Missing".into(), start_tick: 0, source_in_tick: 0, duration_ticks: 1, speed: 1.0, volume: 1.0, transform: Transform::default(), effects: vec![], transition_in: None, transition_out: None });
+        project.active_sequence_mut().unwrap().tracks[0].clips.push(TimelineClip { id: "clip".into(), asset_id: "missing".into(), name: "Missing".into(), start_tick: 0, source_in_tick: 0, duration_ticks: 1, speed: 1.0, volume: 1.0, transform: Transform::default(), keyframes: vec![], effects: vec![], transition_in: None, transition_out: None });
         assert!(validate_project(&project).is_err());
     }
 }
