@@ -46,6 +46,16 @@ export function mediaVolume(clip: TimelineClip, track: TimelineTrack): { muted: 
   };
 }
 
+export function needsCompatibilityProxy(asset: Pick<MediaAsset, "codec" | "width" | "height">): boolean {
+  if (!asset.width || !asset.height) return false;
+  const codec = asset.codec?.trim().toLowerCase();
+  return codec === "av1" || codec === "vp9" || codec === "vp8" || codec === "hevc" || codec === "h265";
+}
+
+export function isCurrentCompatibilityProxy(path: string | undefined): boolean {
+  return path?.toLowerCase().endsWith(".proxy-v3.mp4") ?? false;
+}
+
 export function playbackFailureMessage(assetName: string, error?: unknown, mediaErrorCode?: number): string {
   const errorName = error instanceof DOMException ? error.name : "";
   if (errorName === "NotAllowedError") return "A reprodução foi bloqueada pelo sistema. Clique novamente em Reproduzir.";

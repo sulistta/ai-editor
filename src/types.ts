@@ -163,7 +163,7 @@ export interface ChatMessage {
 
 export interface EditorJob {
   id: string;
-  kind: "proxy" | "download" | "transcription" | "render" | "agent";
+  kind: "proxy" | "download" | "model" | "transcription" | "render" | "agent";
   label: string;
   state: JobState;
   progress: number;
@@ -233,4 +233,22 @@ export interface RuntimeStatus {
   whisper: DependencyStatus;
   model: DependencyStatus;
   youtube: DependencyStatus;
+}
+
+export interface WhisperModelInfo {
+  id: string;
+  filename: string;
+  label: string;
+  detail: string;
+  sizeBytes: number;
+  sha256: string;
+  recommended: boolean;
+}
+
+export interface WhisperModelStatus {
+  info: WhisperModelInfo;
+  path: string;
+  downloaded: boolean;
+  verified: boolean;
+  active: boolean;
 }

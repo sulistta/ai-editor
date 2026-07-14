@@ -10,6 +10,7 @@ import type {
   RuntimeStatus,
   Transcript,
   TranscriptionRequest,
+  WhisperModelStatus,
 } from "../types";
 
 export function isTauriRuntime(): boolean {
@@ -69,6 +70,11 @@ export const nativeApi = {
   import: (path: string, name: string) => invoke<MediaAsset>("media_import", { path, name }),
   importUrl: (url: string) => invoke<MediaAsset>("media_import_url", { url }),
   proxy: (path: string, fingerprint?: string) => invoke<string>("media_proxy", { path, fingerprint }),
+  modelStatus: () => invoke<WhisperModelStatus[]>("model_status"),
+  modelDownload: (modelId: string) => invoke<WhisperModelStatus>("model_download", { modelId }),
+  modelCancelDownload: () => invoke<void>("model_cancel_download"),
+  modelActivate: (modelId: string) => invoke<WhisperModelStatus>("model_activate", { modelId }),
+  modelDelete: (modelId: string) => invoke<void>("model_delete", { modelId }),
   transcribe: (request: TranscriptionRequest) => invoke<Transcript>("transcription_start", { request }),
   planEdit: (prompt: string, project: EditorProject, history: ChatMessage[]) => invoke<GeminiPlan>("agent_plan", { prompt, project, history: history.map(({ role, text }) => ({ role, text })) }),
   setGeminiKey: (apiKey: string) => invoke<void>("gemini_key_set", { apiKey }),

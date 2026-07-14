@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::models;
 use serde::Serialize;
 use std::path::PathBuf;
 use tauri::Manager;
@@ -12,8 +13,25 @@ pub fn ffprobe_binary() -> PathBuf {
     std::env::var_os("FFPROBE_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("ffprobe"))
 }
 
-pub fn whisper_binary() -> PathBuf {
-    std::env::var_os("WHISPER_CLI_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("whisper-cli"))
+pub fn whisper_binary(app: &tauri::AppHandle) -> PathBuf {
+    let executable_name = if cfg!(target_os = "windows") { "whisper-cli.exe" } else { "whisper-cli" };
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            let candidate = directory.join(executable_name);
+            if candidate.is_file() { return candidate; }
+        }
+    }
+    if let Ok(directory) = app.path().resource_dir() {
+        for candidate in [directory.join(executable_name), directory.join("binaries").join(executable_name)] {
+            if candidate.is_file() { return candidate; }
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries/whisper-cli-x86_64-unknown-linux-gnu");
+        if candidate.is_file() { return candidate; }
+    }
+    PathBuf::from(executable_name)
 }
 
 pub fn ytdlp_binary(app: &tauri::AppHandle) -> PathBuf {
@@ -38,20 +56,17 @@ pub fn ytdlp_binary(app: &tauri::AppHandle) -> PathBuf {
     PathBuf::from("yt-dlp")
 }
 
-pub fn resolve_whisper_model(requested: Option<&str>) -> Result<PathBuf, AppError> {
+pub fn resolve_whisper_model(requested: Option<&str>, app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
     if let Some(path) = requested.map(str::trim).filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path).ok_or_else(|| AppError::new("WHISPER_MODEL_MISSING", "O modelo selecionado não foi encontrado"));
     }
-    if let Ok(path) = std::env::var("WHISPER_MODEL_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() { return Ok(path); }
-    }
+    if let Some(path) = models::active_model_path(app) { return Ok(path); }
     let candidates = [
         PathBuf::from("models/ggml-large-v3-turbo-q5_0.bin"),
         PathBuf::from("../models/ggml-large-v3-turbo-q5_0.bin"),
     ];
-    candidates.into_iter().find(|path| path.is_file()).ok_or_else(|| AppError::new("WHISPER_MODEL_MISSING", "Selecione um modelo .bin ou configure WHISPER_MODEL_PATH"))
+    candidates.into_iter().find(|path| path.is_file()).ok_or_else(|| AppError::new("WHISPER_MODEL_MISSING", "Baixe e ative um modelo Whisper no painel Media ou selecione um arquivo .bin"))
 }
 
 #[derive(Debug, Serialize)]
@@ -87,7 +102,7 @@ pub async fn runtime_status(model_path: Option<String>, app: tauri::AppHandle) -
     let (ffmpeg, ffprobe, whisper, ytdlp, node) = tokio::join!(
         dependency(ffmpeg_binary(), "-version"),
         dependency(ffprobe_binary(), "-version"),
-        dependency(whisper_binary(), "--help"),
+        dependency(whisper_binary(&app), "--help"),
         dependency(ytdlp_binary(&app), "--version"),
         dependency(PathBuf::from("node"), "--version"),
     );
@@ -96,7 +111,7 @@ pub async fn runtime_status(model_path: Option<String>, app: tauri::AppHandle) -
     } else {
         DependencyStatus { available: false, detail: format!("yt-dlp: {} · Node 22+: {}", ytdlp.detail, node.detail) }
     };
-    let model = match resolve_whisper_model(model_path.as_deref()) {
+    let model = match resolve_whisper_model(model_path.as_deref(), &app) {
         Ok(path) => DependencyStatus { available: true, detail: path.to_string_lossy().into_owned() },
         Err(error) => DependencyStatus { available: false, detail: error.message },
     };

@@ -1,0 +1,21 @@
+{
+  "score": 95,
+  "threshold": 90,
+  "threshold_passed": true,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [
+    "A referência mostra um estado vazio com conteúdo pequeno e isolado no centro do painel.",
+    "A implementação usa o mesmo espaço para uma ficha de orientação e exemplos editáveis, mantendo o compositor no rodapé."
+  ],
+  "suggestions": [
+    "Manter os exemplos limitados a operações realmente disponíveis para o agente local."
+  ],
+  "next_actions": [
+    "Preservar o preenchimento sem envio automático em futuras alterações aos exemplos."
+  ],
+  "reasoning": "A captura desktop preserva o editor Industrial, com fundo preto, IBM Plex Mono, linhas de 1 px e âmbar como único sinal. O painel deixa de parecer vazio sem adicionar conteúdo fictício: cada exemplo descreve uma edição real e apenas preenche o campo de mensagem.",
+  "reference_images": [
+    "/home/vitor/.tmp/bun/codex-clipboard-jLjzT9.png"
+  ]
+}

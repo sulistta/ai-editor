@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'",
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
         "scope": {
@@ -36,7 +36,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/yt-dlp"],
+    "externalBin": ["binaries/yt-dlp", "binaries/whisper-cli"],
     "resources": []
   }
 }

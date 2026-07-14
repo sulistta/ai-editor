@@ -24,10 +24,9 @@ Não são usados kits de componentes, bibliotecas de timeline ou pacotes de íco
 - Rust 1.77.2+;
 - dependências nativas exigidas pelo Tauri para o sistema operacional;
 - `ffmpeg` e `ffprobe` no `PATH`, ou `FFMPEG_PATH` / `FFPROBE_PATH`;
-- `whisper-cli` no `PATH`, ou `WHISPER_CLI_PATH`;
-- um modelo GGML do whisper.cpp. O padrão procurado é `models/ggml-large-v3-turbo-q5_0.bin`; também é possível selecioná-lo na interface ou usar `WHISPER_MODEL_PATH`.
+- O aplicativo inclui o motor `whisper-cli` e oferece o download dos modelos GGML do whisper.cpp na seção **Modelos** do painel Media. Um arquivo `.bin` local também pode ser selecionado pela interface.
 
-Pesos e binários de terceiros não são versionados nem redistribuídos aqui. Isso mantém o repositório leve e evita impor uma escolha de licença/arquitetura aos pacotes de Windows, macOS e Linux.
+Os pesos dos modelos não são versionados nem redistribuídos aqui. O sidecar Linux de `whisper-cli` fica em `src-tauri/binaries`; builds de outras arquiteturas devem fornecer o binário correspondente.
 
 ## Desenvolvimento
 
@@ -83,6 +82,6 @@ Os testes Rust incluem uma renderização sintética real com FFmpeg, além de t
 
 ## Empacotamento
 
-`bun run tauri build` gera os pacotes nativos. Para uma distribuição autocontida, forneça builds licenciados de FFmpeg/FFprobe, `whisper-cli` e o modelo escolhido como sidecars/resources por plataforma e ajuste `src-tauri/tauri.conf.json`. Em desenvolvimento, os executáveis podem permanecer no `PATH`.
+`bun run tauri build` gera os pacotes nativos. Para uma distribuição autocontida, forneça builds licenciados de FFmpeg/FFprobe e `whisper-cli` para cada plataforma; o usuário baixa o modelo escolhido pelo painel Media. Em desenvolvimento, FFmpeg/FFprobe podem permanecer no `PATH`.
 
 Detalhes técnicos estão em [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) e a fronteira de dados em [docs/PRIVACY.md](docs/PRIVACY.md). O contrato visual está em [DESIGN.md](DESIGN.md).

@@ -2,11 +2,11 @@ import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEditor } from "../context/EditorContext";
-import { activePlaybackItem, mediaVolume, playbackFailureMessage, playbackItemAtOrAfter, playbackItems, resolvePlaybackAsset, timelineTickToMediaSeconds, type PlaybackItem } from "../lib/playback";
+import { activePlaybackItem, isCurrentCompatibilityProxy, mediaVolume, needsCompatibilityProxy, playbackFailureMessage, playbackItemAtOrAfter, playbackItems, resolvePlaybackAsset, timelineTickToMediaSeconds, type PlaybackItem } from "../lib/playback";
 import { activeSequence, captionsFromTranscript, createId, sequenceDuration } from "../lib/project";
 import { chooseExportPath, chooseMediaPaths, chooseProjectOpenPath, chooseProjectPath, chooseWhisperModelPath, errorMessage, isTauriRuntime, nativeApi } from "../lib/tauri";
 import { formatTimecode, secondsToTicks, ticksToSeconds } from "../lib/time";
-import type { CaptionCue, EffectInstance, MediaAsset, RuntimeStatus, TimelineClip } from "../types";
+import type { CaptionCue, EffectInstance, MediaAsset, RuntimeStatus, TimelineClip, WhisperModelStatus } from "../types";
 import { Icon, type IconName } from "./Icons";
 import { Timeline } from "./Timeline";
 
@@ -24,6 +24,11 @@ function selectedClipData(project: ReturnType<typeof useEditor>["project"], clip
     if (clip) return { clip, track };
   }
   return undefined;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes > 500 * 1024 * 1024 ? 0 : 1)} MiB`;
 }
 
 async function probeBrowserFile(file: File): Promise<MediaAsset> {
@@ -132,7 +137,43 @@ function MediaPanel() {
   const [showUrlImport, setShowUrlImport] = useState(false);
   const [downloadingUrl, setDownloadingUrl] = useState(false);
   const [modelPath, setModelPath] = useState(() => localStorage.getItem("whisperModelPath") ?? "");
+  const [showModels, setShowModels] = useState(false);
+  const [models, setModels] = useState<WhisperModelStatus[]>([]);
+  const [modelBusy, setModelBusy] = useState<string>();
+  const modelManagerRef = useRef<HTMLElement>(null);
+  const setEditorJob = editor.setJob;
+  const setEditorError = editor.setError;
   const filtered = editor.project.assets.filter((asset) => asset.name.toLowerCase().includes(query.toLowerCase()));
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    const load = async () => {
+      try {
+        const next = await nativeApi.modelStatus();
+        if (disposed) return;
+        setModels(next);
+        const active = next.find((item) => item.active);
+        if (active) {
+          setModelPath(active.path);
+          localStorage.setItem("whisperModelPath", active.path);
+        } else if (!next.some((item) => item.downloaded)) {
+          setShowModels(true);
+        }
+      } catch (error) {
+        if (!disposed) setEditorError(errorMessage(error));
+      }
+    };
+    void load();
+    return () => {
+      disposed = true;
+    };
+  }, [setEditorError, setEditorJob]);
+
+  useEffect(() => {
+    if (!showModels || !modelManagerRef.current) return;
+    modelManagerRef.current.scrollIntoView({ block: "end" });
+  }, [models.length, showModels]);
 
   const importFiles = async () => {
     if (!isTauriRuntime()) {
@@ -145,7 +186,7 @@ function MediaPanel() {
         const name = path.split(/[\\/]/).at(-1) ?? "Mídia";
         const asset = await nativeApi.import(path, name);
         await editor.importAsset(asset);
-        if (asset.width && asset.height) void createProxy(asset);
+        if (needsCompatibilityProxy(asset)) void createProxy(asset);
       } catch (error) {
         editor.setError(errorMessage(error));
       }
@@ -172,7 +213,7 @@ function MediaPanel() {
     try {
       const asset = await nativeApi.importUrl(value);
       await editor.importAsset(asset);
-      if (asset.width && asset.height) void createProxy(asset);
+      if (needsCompatibilityProxy(asset)) void createProxy(asset);
       editor.setJob({ id: jobId, kind: "download", label: `YouTube · ${asset.name}`, state: "completed", progress: 1 });
       editor.setStatus("Vídeo do YouTube importado");
       setUrl("");
@@ -189,6 +230,11 @@ function MediaPanel() {
   const transcribe = async (asset: MediaAsset) => {
     if (!asset.path || !isTauriRuntime()) {
       editor.setStatus("A transcrição local requer o aplicativo desktop e um arquivo com caminho local");
+      return;
+    }
+    if (!modelPath && !models.some((item) => item.active && item.verified)) {
+      setShowModels(true);
+      editor.setStatus("Baixe e ative um modelo Whisper antes de transcrever");
       return;
     }
     const jobId = `transcription-${asset.id}`;
@@ -239,6 +285,65 @@ function MediaPanel() {
     editor.setStatus("Modelo whisper.cpp configurado");
   };
 
+  const refreshModels = async () => {
+    const next = await nativeApi.modelStatus();
+    setModels(next);
+    const active = next.find((item) => item.active);
+    if (active) {
+      setModelPath(active.path);
+      localStorage.setItem("whisperModelPath", active.path);
+    }
+  };
+
+  const downloadModel = async (model: WhisperModelStatus) => {
+    if (modelBusy) return;
+    const jobId = `model-${model.info.id}`;
+    setModelBusy(model.info.id);
+    editor.setJob({ id: jobId, kind: "model", label: `Baixando ${model.info.label}`, state: "running", progress: 0 });
+    editor.setStatus(`Baixando modelo ${model.info.label}`);
+    try {
+      const active = await nativeApi.modelDownload(model.info.id);
+      setModelPath(active.path);
+      localStorage.setItem("whisperModelPath", active.path);
+      await refreshModels();
+      editor.setJob({ id: jobId, kind: "model", label: `Modelo ${model.info.label}`, state: "completed", progress: 1 });
+      editor.setStatus(`Modelo ${model.info.label} ativo`);
+    } catch (error) {
+      editor.setJob({ id: jobId, kind: "model", label: `Modelo ${model.info.label}`, state: "failed", progress: 0, detail: errorMessage(error) });
+      editor.setError(errorMessage(error));
+    } finally {
+      setModelBusy(undefined);
+    }
+  };
+
+  const cancelModelDownload = async () => {
+    if (!modelBusy) return;
+    await nativeApi.modelCancelDownload();
+    editor.setStatus("Download do modelo cancelado");
+  };
+
+  const activateModel = async (model: WhisperModelStatus) => {
+    try {
+      const active = await nativeApi.modelActivate(model.info.id);
+      setModelPath(active.path);
+      localStorage.setItem("whisperModelPath", active.path);
+      await refreshModels();
+      editor.setStatus(`Modelo ${model.info.label} ativo`);
+    } catch (error) {
+      editor.setError(errorMessage(error));
+    }
+  };
+
+  const deleteModel = async (model: WhisperModelStatus) => {
+    try {
+      await nativeApi.modelDelete(model.info.id);
+      await refreshModels();
+      editor.setStatus(`Modelo ${model.info.label} removido`);
+    } catch (error) {
+      editor.setError(errorMessage(error));
+    }
+  };
+
   return (
     <div className="panel-content media-panel">
       <div className="panel-action-row">
@@ -276,7 +381,17 @@ function MediaPanel() {
         })}
       </div>
       {filtered.length > 0 && <p className="panel-hint">Clique duas vezes para inserir na timeline.</p>}
-      <div className="local-model"><span><Icon name="settings" /><span><strong>whisper.cpp local</strong><small>{modelPath ? modelPath.split(/[\\/]/).at(-1) : "Modelo automático ou WHISPER_MODEL_PATH"}</small></span></span><button className="text-button" onClick={() => void chooseModel()} disabled={!isTauriRuntime()}>Modelo</button></div>
+      {showModels && <section ref={modelManagerRef} className="model-manager" aria-label="Modelos locais">
+        <header><span><Icon name="settings" /><span><strong>Modelos locais</strong><small>{modelPath ? modelPath.split(/[\\/]/).at(-1) : "Nenhum modelo ativo"}</small></span></span><button className="text-button compact" onClick={() => void chooseModel()} disabled={!isTauriRuntime()}>Arquivo .bin</button></header>
+        {!isTauriRuntime() ? <p className="model-empty">Disponível no aplicativo desktop.</p> : models.length === 0 ? <p className="model-empty">Carregando modelos…</p> : <div className="model-list">{models.map((model) => {
+          const downloading = modelBusy === model.info.id;
+          return <article className={`model-option ${model.active ? "active" : ""}`} key={model.info.id}>
+            <div className="model-copy"><div><strong>{model.info.label}</strong>{model.info.recommended && <span className="model-badge">Recomendado</span>}{model.active && <span className="model-badge active">Ativo</span>}</div><small>{model.info.detail} · {formatBytes(model.info.sizeBytes)}</small></div>
+            <div className="model-actions">{downloading ? <><span className="model-progress">Baixando…</span><button className="text-button compact" onClick={() => void cancelModelDownload()}>Cancelar</button></> : model.active ? <span className="model-ready">Pronto</span> : model.downloaded && model.verified ? <><button className="text-button compact" onClick={() => void activateModel(model)}>Ativar</button><button className="icon-button compact" onClick={() => void deleteModel(model)} aria-label={`Excluir modelo ${model.info.label}`} title={`Excluir modelo ${model.info.label}`}><Icon name="trash" /></button></> : <button className="primary-button compact" onClick={() => void downloadModel(model)}>Baixar</button>}</div>
+          </article>;
+        })}</div>}
+      </section>}
+      <div className="local-model"><span><Icon name="settings" /><span><strong>whisper.cpp local</strong><small>{modelPath ? modelPath.split(/[\\/]/).at(-1) : "Nenhum modelo ativo"}</small></span></span><div className="local-model-actions"><button className={`text-button compact ${showModels ? "active" : ""}`} onClick={() => setShowModels((value) => !value)} disabled={!isTauriRuntime()}>Modelos</button><button className="text-button compact" onClick={() => void chooseModel()} disabled={!isTauriRuntime()}>Arquivo</button></div></div>
     </div>
   );
 }
@@ -555,7 +670,7 @@ function Viewer() {
       return true;
     }
     const unsupported = (error instanceof DOMException && error.name === "NotSupportedError") || mediaErrorCode === 4 || mediaErrorCode === 3;
-    const legacyProxyFailed = Boolean(target.proxyPath && target.proxyPath === localSource && !target.proxyPath.includes(".proxy-v2."));
+    const legacyProxyFailed = Boolean(target.proxyPath && target.proxyPath === localSource && !isCurrentCompatibilityProxy(target.proxyPath));
     if (unsupported && target.path && isTauriRuntime() && (!target.proxyPath || legacyProxyFailed) && !proxyAttemptsRef.current.has(target.id)) {
       void createPlaybackProxy(target);
       return true;
@@ -739,18 +854,26 @@ function InspectorPanel() {
 }
 
 const visualTerms = ["olhar", "rosto", "cor do", "aparece", "imagem", "enquadramento", "objeto"];
+const chatStarters = [
+  "Corte a introdução",
+  "Remova as pausas longas",
+  "Crie legendas a partir da transcrição",
+];
 
 function ChatPanel() {
   const editor = useEditor();
   const [prompt, setPrompt] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
-  const messagesEnd = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const cancelledRef = useRef(false);
   const busy = editor.agentSteps.some((step) => step.state === "running");
   useEffect(() => {
-    messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
-  }, [editor.messages]);
+    const messages = messagesRef.current;
+    if (!messages) return;
+    messages.scrollTo({ top: messages.scrollHeight, behavior: "smooth" });
+  }, [editor.messages, editor.agentSteps]);
 
   const configureKey = async () => {
     if (!apiKey.trim() || !isTauriRuntime()) return;
@@ -762,6 +885,11 @@ function ChatPanel() {
     } catch (error) {
       editor.setError(errorMessage(error));
     }
+  };
+
+  const fillStarter = (text: string) => {
+    setPrompt(text);
+    requestAnimationFrame(() => composerRef.current?.focus());
   };
 
   const send = async () => {
@@ -808,19 +936,23 @@ function ChatPanel() {
 
   return (
     <div className="chat-panel">
-      <div className="chat-config">
-        <span>Gemini usa somente texto</span>
-        <button className="text-link" onClick={() => setShowKey(!showKey)}>Chave da sessão</button>
+      <div className="chat-settings">
+        <div className="chat-config">
+          <span>Gemini usa somente texto</span>
+          <button className="text-link" onClick={() => setShowKey(!showKey)}>Chave da sessão</button>
+        </div>
+        {showKey && <div className="key-entry"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="GEMINI_API_KEY" /><button className="text-button" onClick={() => void configureKey()}>Aplicar</button></div>}
       </div>
-      {showKey && <div className="key-entry"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="GEMINI_API_KEY" /><button className="text-button" onClick={() => void configureKey()}>Aplicar</button></div>}
-      <div className="messages" aria-live="polite">
-        {editor.messages.length === 0 && <div className="empty-chat"><Icon name="chat" /><strong>Descreva a edição</strong><p>O agente recebe transcript, seleção e estado da timeline. Áudio e vídeo permanecem locais.</p></div>}
+      <div ref={messagesRef} className="messages" aria-live="polite">
+        {editor.messages.length === 0 && <div className="empty-chat">
+          <div className="empty-chat-intro"><span className="empty-chat-icon"><Icon name="chat" /></span><div><strong>Descreva a edição</strong><p>O agente usa a transcrição, a seleção e a timeline. Áudio e vídeo permanecem locais.</p></div></div>
+          <div className="chat-starters"><span>Experimente</span>{chatStarters.map((starter) => <button key={starter} type="button" className="chat-starter" onClick={() => fillStarter(starter)}>{starter}</button>)}</div>
+        </div>}
         {editor.messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span>{message.role === "user" ? "Você" : message.role === "assistant" ? "Gemini" : "Sistema"}</span><p>{message.text}</p></article>)}
         {editor.agentSteps.length > 0 && <div className="agent-ledger">{editor.agentSteps.map((step) => <div key={step.id} data-state={step.state}><span className="step-indicator" /><span>{step.label}</span><small>{step.state}</small></div>)}</div>}
-        <div ref={messagesEnd} />
       </div>
       <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void send(); }}>
-        <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Descreva o resultado desejado" rows={3} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
+        <textarea ref={composerRef} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Descreva o resultado desejado" rows={3} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
         <div><span>Enter envia · Shift+Enter quebra linha</span>{busy ? <button type="button" className="stop-button" onClick={() => { cancelledRef.current = true; editor.setAgentSteps(editor.agentSteps.map((step) => step.state === "running" || step.state === "queued" ? { ...step, state: "cancelled" } : step)); }}><Icon name="stop" /> Stop</button> : <button className="send-button" aria-label="Enviar"><Icon name="send" /></button>}</div>
       </form>
     </div>

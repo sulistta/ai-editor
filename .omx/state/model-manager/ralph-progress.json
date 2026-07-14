@@ -1,0 +1,19 @@
+{
+  "score": 94,
+  "threshold": 90,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [
+    "Reference contains an imported clip and populated monitor; validation state intentionally uses the empty project state.",
+    "The model manager adds a scrollable utility section below the media list."
+  ],
+  "suggestions": [],
+  "reasoning": "The updated screenshot preserves the Industrial dark editor hierarchy, amber action language, compact IBM Plex Mono typography, and aligned panel/timeline geometry. The model manager now auto-scrolls so all four choices are visible without hiding the primary editor controls.",
+  "next_actions": [
+    "Keep the model manager auto-scroll behavior covered by the desktop smoke test."
+  ],
+  "generated_screenshot": "/tmp/ai-editor-model-manager-after-2.png",
+  "reference_images": [
+    "/home/vitor/.tmp/bun/codex-clipboard-7tjmuY.png"
+  ]
+}

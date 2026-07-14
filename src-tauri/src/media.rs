@@ -7,6 +7,9 @@ use tauri::Manager;
 use tokio::process::Command;
 use uuid::Uuid;
 
+const YOUTUBE_MONITOR_FORMAT: &str = "bv*[vcodec^=avc1][height<=1080]+ba[ext=m4a]/b[vcodec^=avc1][ext=mp4][height<=1080]/bv*[height<=1080]+ba/b[height<=1080]";
+const PROXY_VERSION: &str = "proxy-v3";
+
 pub(crate) fn allow_asset_file(app: &tauri::AppHandle, path: &Path) -> Result<(), AppError> {
     app.asset_protocol_scope()
         .allow_file(path)
@@ -135,10 +138,10 @@ pub async fn media_import(path: String, name: String, app: tauri::AppHandle) -> 
 #[tauri::command]
 pub async fn media_import_url(url: String, app: tauri::AppHandle) -> Result<MediaAsset, AppError> {
     let url = validate_youtube_url(&url)?;
-    let directory = app.path().app_cache_dir().map_err(|error| AppError::new("CACHE_PATH", error.to_string()))?.join("youtube");
+    let directory = app.path().app_cache_dir().map_err(|error| AppError::new("CACHE_PATH", error.to_string()))?.join("youtube").join("monitor-v1");
     tokio::fs::create_dir_all(&directory).await?;
     let output = Command::new(ytdlp_binary(&app))
-        .args(["--ignore-config", "--no-playlist", "--no-progress", "--no-overwrites", "--windows-filenames", "--js-runtimes", "node", "--print", "after_move:filepath", "--merge-output-format", "mp4", "-f", "bv*[height<=1080]+ba/b[height<=1080]"])
+        .args(["--ignore-config", "--no-playlist", "--no-progress", "--no-overwrites", "--windows-filenames", "--js-runtimes", "node", "--print", "after_move:filepath", "--merge-output-format", "mp4", "-f", YOUTUBE_MONITOR_FORMAT])
         .arg("-P").arg(&directory)
         .args(["-o", "%(title).120B [%(id)s].%(ext)s", "--"])
         .arg(&url)
@@ -163,47 +166,28 @@ pub async fn media_proxy(path: String, fingerprint: Option<String>, app: tauri::
     let directory = app.path().app_cache_dir().map_err(|error| AppError::new("CACHE_PATH", error.to_string()))?.join("proxies");
     tokio::fs::create_dir_all(&directory).await?;
     let key = fingerprint.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let output_path = directory.join(format!("{key}.proxy-v2.webm"));
+    let output_path = directory.join(format!("{key}.{PROXY_VERSION}.mp4"));
     if output_path.is_file() {
         allow_asset_file(&app, &output_path)?;
         return Ok(output_path.to_string_lossy().into_owned());
     }
-    let temp_path = directory.join(format!("{key}.{}.tmp.webm", Uuid::new_v4()));
-    let webm = Command::new(ffmpeg_binary())
+    let temp_path = directory.join(format!("{key}.{}.tmp.mp4", Uuid::new_v4()));
+    let proxy = Command::new(ffmpeg_binary())
         .args(["-hide_banner", "-v", "error", "-y", "-i"]).arg(&source)
-        .args(["-vf", "scale=-2:720:force_original_aspect_ratio=decrease", "-c:v", "libvpx", "-deadline", "good", "-cpu-used", "4", "-crf", "31", "-b:v", "0", "-c:a", "libopus", "-b:a", "96k"])
+        .args(["-map", "0:v:0", "-map", "0:a:0?", "-vf", "scale=-2:720:force_original_aspect_ratio=decrease", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"])
         .arg(&temp_path).output().await
         .map_err(|error| AppError::new("FFMPEG_NOT_FOUND", format!("Não foi possível iniciar FFmpeg: {error}")))?;
-    if webm.status.success() {
-        tokio::fs::rename(&temp_path, &output_path).await?;
-        allow_asset_file(&app, &output_path)?;
-        return Ok(output_path.to_string_lossy().into_owned());
+    if !proxy.status.success() {
+        let detail = String::from_utf8_lossy(&proxy.stderr).trim().to_string();
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(AppError::new("PROXY_FAILED", detail));
     }
-    let webm_error = String::from_utf8_lossy(&webm.stderr).trim().to_string();
-    let _ = tokio::fs::remove_file(&temp_path).await;
-
-    let fallback_path = directory.join(format!("{key}.proxy-v2.mp4"));
-    if fallback_path.is_file() {
-        allow_asset_file(&app, &fallback_path)?;
-        return Ok(fallback_path.to_string_lossy().into_owned());
-    }
-    let fallback_temp = directory.join(format!("{key}.{}.tmp.mp4", Uuid::new_v4()));
-    let mp4 = Command::new(ffmpeg_binary())
-        .args(["-hide_banner", "-v", "error", "-y", "-i"]).arg(&source)
-        .args(["-vf", "scale=-2:720:force_original_aspect_ratio=decrease", "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"])
-        .arg(&fallback_temp).output().await
-        .map_err(|error| AppError::new("FFMPEG_NOT_FOUND", format!("Não foi possível iniciar FFmpeg: {error}")))?;
-    if !mp4.status.success() {
-        let mp4_error = String::from_utf8_lossy(&mp4.stderr).trim().to_string();
-        let _ = tokio::fs::remove_file(&fallback_temp).await;
-        return Err(AppError::new("PROXY_FAILED", format!("WebM: {webm_error}\nMP4: {mp4_error}")));
-    }
-    if let Err(error) = tokio::fs::rename(&fallback_temp, &fallback_path).await {
-        let _ = tokio::fs::remove_file(&fallback_temp).await;
+    if let Err(error) = tokio::fs::rename(&temp_path, &output_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
         return Err(error.into());
     }
-    allow_asset_file(&app, &fallback_path)?;
-    Ok(fallback_path.to_string_lossy().into_owned())
+    allow_asset_file(&app, &output_path)?;
+    Ok(output_path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -222,5 +206,12 @@ mod tests {
         assert!(validate_youtube_url("https://youtu.be/dQw4w9WgXcQ").is_ok());
         assert!(validate_youtube_url("http://youtube.com/watch?v=x").is_err());
         assert!(validate_youtube_url("https://youtube.com.example.test/watch?v=x").is_err());
+    }
+
+    #[test]
+    fn youtube_download_prefers_monitor_compatible_streams() {
+        assert!(YOUTUBE_MONITOR_FORMAT.contains("vcodec^=avc1"));
+        assert!(YOUTUBE_MONITOR_FORMAT.contains("ba[ext=m4a]"));
+        assert!(YOUTUBE_MONITOR_FORMAT.ends_with("bv*[height<=1080]+ba/b[height<=1080]"));
     }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Sequence, TimelineClip, TimelineTrack } from "../types";
-import { activePlaybackItem, mediaVolume, playbackFailureMessage, playbackItemAtOrAfter, playbackItems, resolvePlaybackAsset, timelineTickToMediaSeconds } from "./playback";
+import { activePlaybackItem, isCurrentCompatibilityProxy, mediaVolume, needsCompatibilityProxy, playbackFailureMessage, playbackItemAtOrAfter, playbackItems, resolvePlaybackAsset, timelineTickToMediaSeconds } from "./playback";
 
 function clip(id: string, startTick = 0, durationTicks = 240_000): TimelineClip {
   return {
@@ -67,5 +67,17 @@ describe("playback media mapping", () => {
 
   it("returns an actionable message for unsupported media", () => {
     expect(playbackFailureMessage("camera.mkv", undefined, 4)).toContain("proxy 720p");
+  });
+
+  it("requests proxies only for known incompatible video codecs", () => {
+    expect(needsCompatibilityProxy({ codec: "av1", width: 1920, height: 1080 })).toBe(true);
+    expect(needsCompatibilityProxy({ codec: "vp9", width: 1920, height: 1080 })).toBe(true);
+    expect(needsCompatibilityProxy({ codec: "h264", width: 1920, height: 1080 })).toBe(false);
+    expect(needsCompatibilityProxy({ codec: "aac", width: undefined, height: undefined })).toBe(false);
+  });
+
+  it("recognizes only the current H.264 proxy generation", () => {
+    expect(isCurrentCompatibilityProxy("/cache/media.proxy-v3.mp4")).toBe(true);
+    expect(isCurrentCompatibilityProxy("/cache/media.proxy-v2.webm")).toBe(false);
   });
 });

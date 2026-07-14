@@ -1,5 +1,4 @@
 # Modelos locais
 
-O aplicativo procura o modelo configurado pelo usuário ou `WHISPER_MODEL_PATH`.
-O pacote de produção deve fornecer `ggml-large-v3-turbo-q5_0.bin` com hash verificado.
-Pesos grandes não são versionados neste repositório.
+O aplicativo exibe os modelos oficiais compatíveis no painel Media e os baixa somente após ação explícita do usuário.
+Os pesos ficam em `app_data_dir/models`, são validados por digest e não são enviados junto com o repositório.

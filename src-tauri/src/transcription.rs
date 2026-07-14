@@ -77,9 +77,9 @@ async fn ensure_success(command: &str, output: std::process::Output, code: &str)
 }
 
 #[tauri::command]
-pub async fn transcription_start(request: TranscriptionRequest) -> Result<Transcript, AppError> {
+pub async fn transcription_start(request: TranscriptionRequest, app: tauri::AppHandle) -> Result<Transcript, AppError> {
     let media = tokio::fs::canonicalize(&request.media_path).await.map_err(|_| AppError::new("MEDIA_NOT_FOUND", "A mídia para transcrição não foi encontrada"))?;
-    let model = resolve_whisper_model(request.model_path.as_deref())?;
+    let model = resolve_whisper_model(request.model_path.as_deref(), &app)?;
     let probe = probe_path(media.to_string_lossy().as_ref()).await?;
     if !probe.has_audio { return Err(AppError::new("NO_AUDIO", "O arquivo não possui uma faixa de áudio")); }
 
@@ -96,7 +96,7 @@ pub async fn transcription_start(request: TranscriptionRequest) -> Result<Transc
         return Err(error);
     }
 
-    let mut command = Command::new(whisper_binary());
+    let mut command = Command::new(whisper_binary(&app));
     command.arg("-m").arg(&model).arg("-f").arg(&wav_path).arg("-oj").arg("-of").arg(&output_prefix);
     if let Some(language) = request.language.as_deref() { command.arg("-l").arg(language); }
     let whisper = command.output().await;

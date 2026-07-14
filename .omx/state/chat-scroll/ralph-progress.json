@@ -1,0 +1,21 @@
+{
+  "score": 96,
+  "threshold": 90,
+  "threshold_passed": true,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [
+    "A captura de validação usa um projeto vazio e mensagens de teste, enquanto a referência contém mídia importada.",
+    "A lista de mensagens agora ocupa somente a região central do painel e exibe a própria barra de rolagem quando o histórico excede a altura disponível."
+  ],
+  "suggestions": [
+    "Preservar a ordem fixa cabeçalho, histórico e compositor ao incluir novos controles no chat."
+  ],
+  "next_actions": [
+    "Manter a métrica de rolagem interna em um futuro teste de interface automatizado."
+  ],
+  "reasoning": "A captura com oito solicitações e respostas mantém o compositor alinhado ao rodapé do painel. A lista central tem 263 px visíveis para 1211 px de conteúdo e está ancorada no final, sem alterar a hierarquia Industrial da referência.",
+  "reference_images": [
+    "/home/vitor/.tmp/bun/codex-clipboard-7tjmuY.png"
+  ]
+}
